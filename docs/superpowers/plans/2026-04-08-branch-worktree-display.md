@@ -46,10 +46,10 @@ git diff src/claude_statusbar/
 
 Expected: three files modified. The diff should show:
 - `cli.py`: new `--pet` flag, updated `--pet-name` help text, `show_pet` boolean threaded into `statusbar_main`
-- `core.py`: new `get_effort_label()` function, new `show_pet` kwarg on `main()`, `effort=get_effort_label(model_id)` passed at three `format_status_line` call sites, pet rendering gated on `show_pet`
-- `progress.py`: removed `from claude_statusbar import __version__` import, new `effort: str = ""` kwarg on `format_status_line`, new effort rendering block before bypass
+- `core.py`: new `get_effort_label()` function, new `show_pet` kwarg on `main()`, `effort=get_effort_label(model_id)` passed at three `format_status_line` call sites, pet rendering gated on `show_pet`, one stray blank line added after the version extraction
+- `progress.py`: removed `from claude_statusbar import __version__` import, new `effort: str = ""` kwarg on `format_status_line` signature, new effort rendering block (either dim-colored or plain, depending on `use_color`) inserted between the model append and the bypass check
 
-If the diff shows anything else, stop and ask the user before proceeding.
+If the diff shows substantively more than this (e.g., unrelated feature work in other areas of these files, or changes to files not listed), stop and ask the user before proceeding. Small cosmetic differences from this description are OK as long as the overall intent matches "add effort label + pet opt-in."
 
 - [ ] **Step 2: Stage and commit the effort feature**
 
@@ -247,8 +247,13 @@ def _load_default_branch(common_dir: Path, cwd: str) -> Optional[str]:
     )
     if not output:
         return None
-    # Output is like "origin/main"; strip the remote prefix.
-    name = output.strip().split("/", 1)[-1]
+    # Output is like "origin/main"; strip the remote prefix. We require a
+    # "/" — an output without one is unexpected and not safe to cache as
+    # a "default branch name."
+    stripped = output.strip()
+    if "/" not in stripped:
+        return None
+    name = stripped.split("/", 1)[1]
     if not name:
         return None
     cache[key] = name
@@ -522,12 +527,16 @@ out = format_status_line(
     branch='feature-x', worktree='wt-test',
 )
 print(out)
-assert ' feature-x' in out
-assert '⎇ wt-test' in out
-# Check ordering: branch must appear before worktree must appear before model
-i_branch = out.index(' feature-x')
-i_wt = out.index('⎇ wt-test')
-i_model = out.index('Opus 4.6')
+branch_token = ' feature-x'
+worktree_token = '⎇ wt-test'
+model_token = 'Opus 4.6'
+assert branch_token in out, f'missing branch token: {out!r}'
+assert worktree_token in out, f'missing worktree token: {out!r}'
+assert model_token in out, f'missing model token: {out!r}'
+# Check ordering: branch before worktree before model
+i_branch = out.index(branch_token)
+i_wt = out.index(worktree_token)
+i_model = out.index(model_token)
 assert i_branch < i_wt < i_model, f'wrong order: {i_branch} {i_wt} {i_model}'
 print('OK: branch and worktree both rendered, in the right order')
 "
@@ -975,10 +984,12 @@ Replace with:
 
 Run:
 ```bash
-grep -rn 'countdown_emoji\|get_countdown_emoji\|⏰\|🎉\|U0001f389\|u2728\|u26a1' src/claude_statusbar/
+grep -rEn 'countdown_emoji|get_countdown_emoji|⏰|🎉|U0001f389|u2728|u26a1' src/claude_statusbar/
 ```
 
 Expected: zero matches in any source file (`pet.py`, `core.py`, `progress.py`, etc.). If any matches remain, locate and remove them before continuing. (The `egg-info/PKG-INFO` file is auto-generated and not in `src/claude_statusbar/`; if it shows in unrelated greps, ignore it.)
+
+Note: The `-E` flag is required so that `|` is treated as alternation on BSD grep (macOS). GNU grep accepts either form, but BSD grep treats `\|` as a literal `\|` and returns no matches — silently turning this verification into a no-op.
 
 - [ ] **Step 7: Verify the bar still renders end-to-end**
 
@@ -1062,7 +1073,6 @@ sys.stdin = io.StringIO(json.dumps(payload))
 from claude_statusbar.cli import main
 sys.exit(main())
 "
-git worktree remove /tmp/cs-wt-smoke
 ```
 
 Expected: both ` plan-smoke-test` and `⎇ cs-wt-smoke` tokens appear in the rendered line, branch before worktree, both before the model name.
@@ -1125,6 +1135,14 @@ Expected: status line renders without crashing. No errors on stderr. (Bare repo 
 
 - [ ] **Step 8: Detached HEAD**
 
+First confirm the working tree is clean — `git checkout HEAD~1` with uncommitted changes in tracked files will either refuse (safe) or silently carry changes forward (less safe):
+```bash
+git status --porcelain
+```
+
+Expected: empty output. If it prints anything, stash or commit before proceeding so this smoke test doesn't perturb unrelated work.
+
+Then:
 ```bash
 git checkout HEAD~1
 cat ~/.cache/claude-statusbar/last_stdin.json | python3 -m claude_statusbar.cli
@@ -1145,18 +1163,24 @@ echo "--- cache file contents ---"
 cat ~/.cache/claude-statusbar/default_branches.json
 ```
 
-Expected: warm run is measurably faster than cold (a few ms). Cache file contains one entry whose key is the absolute path to this repo's `.git` directory and whose value is `main`.
+Expected: both runs render the status line correctly. The cache file is created and contains one entry whose key is the absolute path to this repo's `.git` directory and whose value is `main`.
+
+The warm run *should* be slightly faster in theory (one fewer subprocess), but on modern hardware the difference is a few milliseconds against Python interpreter startup noise of 30–100 ms, so a single `time` comparison is unreliable as a pass/fail signal. Treat the timing as informational only — the real check is that the cache file exists with the expected contents after the first run.
 
 - [ ] **Step 10: Git not on PATH (skip if too inconvenient)**
 
-This is hard to simulate cleanly without modifying PATH. If you want to verify, run:
+This is hard to simulate cleanly without modifying PATH. The trick is to put git out of reach of the Python subprocess **without** also hiding the tools the rest of the command needs. The cleanest way is to temporarily shadow `git` with an empty directory added to the front of `PATH`:
+
 ```bash
-PATH=/usr/bin cat ~/.cache/claude-statusbar/last_stdin.json | python3 -m claude_statusbar.cli
+mkdir -p /tmp/cs-empty-path
+cat ~/.cache/claude-statusbar/last_stdin.json | \
+  env PATH=/tmp/cs-empty-path:/nonexistent python3 -m claude_statusbar.cli
+rmdir /tmp/cs-empty-path
 ```
 
-(Adjust `PATH` to a directory that does not contain `git`.)
+The key detail is that `PATH=/tmp/cs-empty-path:/nonexistent` contains no `git` binary anywhere, so `subprocess.run(["git", ...])` raises `FileNotFoundError`, which `_run_git` catches. Python itself is invoked via its full path because the parent shell already resolved `python3` before `env` ran.
 
-Expected: status line renders without branch/worktree tokens. No errors on stderr.
+Expected: status line renders without branch/worktree tokens. No errors on stderr. (Note: do **not** use `PATH=/usr/bin` — that varies by OS, and on macOS `/usr/bin/git` is Xcode's git shim, which is still a working git binary.)
 
 - [ ] **Step 11: No commit needed for this task**
 
@@ -1214,10 +1238,11 @@ git commit -m "chore: bump version for branch/worktree display and icon cleanup"
 Run:
 ```bash
 git status
-git log --oneline -10
+git log --oneline -12
 ```
 
-Expected: clean working tree. The recent log shows (top-to-bottom):
+Expected: clean working tree. The recent log should include (most recent first) roughly the following commits, in this order relative to each other:
+
 1. `chore: bump version for branch/worktree display and icon cleanup`
 2. `refactor: remove alarm icon and countdown emoji system`
 3. `feat(cli): add --no-git flag to suppress branch/worktree display`
@@ -1226,8 +1251,8 @@ Expected: clean working tree. The recent log shows (top-to-bottom):
 6. `feat: add git_info module for branch and worktree detection`
 7. `feat(core): extract cwd from stdin payload`
 8. `feat: add effort label and opt-in pet companion flag`
-9. `docs: address review feedback on branch/worktree spec`
-10. `docs: add spec for branch and worktree display in status bar`
+
+Earlier plan-related commits (the spec, the plan itself, review-feedback commits on either) may appear below these but the exact set depends on how the plan was landed — don't block on their presence. The important signal is that the 8 feature commits above are present, in order, at the top of the log.
 
 ---
 
