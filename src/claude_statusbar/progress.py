@@ -1,7 +1,6 @@
 """Progress bar rendering for the status bar. Pure functions, no I/O."""
 
 from typing import Optional
-from claude_statusbar import __version__
 
 FILL = "█"
 EMPTY = "░"
@@ -182,6 +181,7 @@ def format_status_line(
     countdown_emoji: str = "",
     warning_threshold: Optional[float] = None,
     critical_threshold: Optional[float] = None,
+    effort: str = "",
 ) -> str:
     """Build the complete status bar string.
 
@@ -225,6 +225,11 @@ def format_status_line(
         dim_7d += colorize(f"⏰{reset_time_7d}", overall_color, use_color)
     parts.append(dim_7d)
     parts.append(colorize(model, overall_color, use_color))
+    if effort:
+        if use_color:
+            parts.append(f"{DIM}{effort}{RESET}")
+        else:
+            parts.append(effort)
     if bypass:
         parts.append(colorize("⚠️BYPASS", RED, use_color))
 

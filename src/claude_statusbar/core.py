@@ -498,6 +498,7 @@ def parse_stdin_data() -> Dict[str, Any]:
         # Version
         result['claude_version'] = data.get('version', '')
 
+
         # Mark that we have valid stdin data
         result['_has_stdin'] = True
 
@@ -532,6 +533,24 @@ def is_bypass_permissions_active() -> bool:
         pass
 
     return False
+
+
+def get_effort_label(model_id: str) -> str:
+    """Read effortLevel from settings. For Opus, show 'high/max' when set to high."""
+    effort = ''
+    try:
+        settings_path = Path.home() / '.claude' / 'settings.json'
+        if settings_path.exists():
+            with open(settings_path, 'r', encoding='utf-8') as f:
+                settings = json.load(f)
+            effort = settings.get('effortLevel', '')
+    except Exception:
+        pass
+    if 'opus' in model_id.lower():
+        if effort == 'high':
+            return 'high/max'
+        return effort or 'max'
+    return effort
 
 
 def get_current_model(stdin_data: Optional[Dict[str, Any]] = None) -> tuple[str, str]:
@@ -832,6 +851,7 @@ def main(json_output: bool = False,
                     pet_text=pet_text, countdown_emoji=countdown,
                     warning_threshold=warning_threshold,
                     critical_threshold=critical_threshold,
+                    effort=get_effort_label(model_id),
                 ))
         else:
             # No rate_limits yet — could be session start or old Claude Code
@@ -870,6 +890,7 @@ def main(json_output: bool = False,
                         pet_text=pet_text,
                         warning_threshold=warning_threshold,
                         critical_threshold=critical_threshold,
+                        effort=get_effort_label(model_id),
                     ))
             else:
                 # No stdin at all — not running inside Claude Code statusLine
@@ -885,7 +906,7 @@ def main(json_output: bool = False,
 
     except Exception as e:
         reset_time = calculate_reset_time(reset_hour=reset_hour).replace(" ", "")
-        _, display_name = get_current_model(stdin_data)
+        model_id, display_name = get_current_model(stdin_data)
         bypass = is_bypass_permissions_active()
         if json_output:
             print(json.dumps({"success": False, "error": str(e)}))
@@ -902,6 +923,7 @@ def main(json_output: bool = False,
                 pet_text=pet_text,
                 warning_threshold=warning_threshold,
                 critical_threshold=critical_threshold,
+                effort=get_effort_label(model_id),
             ))
 
 if __name__ == '__main__':
