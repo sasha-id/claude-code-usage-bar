@@ -680,7 +680,12 @@ print("")
     return f"{hours}h {mins:02d}m"
 
 def check_for_updates(session_id: str = ''):
-    """Check for updates once per new session.
+    """Kick off a background update check once per new session.
+
+    MUST return quickly — this runs synchronously in the statusline's hot
+    path. The actual HTTP fetch and `uv tool install --upgrade` happen in
+    a detached subprocess, so Claude Code's startup never waits on PyPI.
+    Any upgrade takes effect silently at the next statusline invocation.
 
     Disabled by setting env CLAUDE_STATUSBAR_NO_UPDATE=1 or
     passing --no-auto-update on the CLI.
@@ -695,32 +700,28 @@ def check_for_updates(session_id: str = ''):
         cache_dir.mkdir(parents=True, exist_ok=True)
         last_session_file = cache_dir / 'last_update_session'
 
-        # Only check when session changes
-        should_check = True
+        # Skip if we've already kicked off a check for this session.
         if session_id and last_session_file.exists():
             try:
-                last_session = last_session_file.read_text().strip()
-                if last_session == session_id:
-                    should_check = False
+                if last_session_file.read_text().strip() == session_id:
+                    return
             except OSError:
                 pass
 
-        if should_check:
-            from .updater import check_and_upgrade
-            success, message = check_and_upgrade()
+        # Claim the session marker BEFORE spawning so concurrent statusline
+        # invocations during the same startup burst don't fire duplicate
+        # background checks (which would race on `uv tool install`).
+        if session_id:
+            try:
+                last_session_file.write_text(session_id)
+            except OSError:
+                pass
 
-            # Record current session
-            if session_id:
-                try:
-                    last_session_file.write_text(session_id)
-                except OSError:
-                    pass
-
-            if success:
-                print(f"🔄 {message}", file=sys.stderr)
+        from .updater import spawn_update_check_background
+        spawn_update_check_background()
 
     except Exception:
-        # Silently fail - don't interrupt main functionality
+        # Never let an update-check error bubble up into the statusline.
         pass
 
 def build_json_output(usage_data: Dict[str, Any], reset_time: str, model: str, display_name: str) -> Dict[str, Any]:

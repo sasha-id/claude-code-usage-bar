@@ -135,6 +135,25 @@ def auto_upgrade() -> bool:
     return False
 
 
+def spawn_update_check_background() -> None:
+    """Fire-and-forget: run check_and_upgrade in a detached subprocess.
+
+    Mirrors cache.refresh_cache_background(). The main process returns
+    immediately so Claude Code's statusline never blocks on PyPI or on
+    `uv tool install`. Any upgrade takes effect at the next statusline
+    invocation.
+    """
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "claude_statusbar.updater_background"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        pass
+
+
 def check_and_upgrade() -> Tuple[bool, str]:
     """Check for updates and upgrade if available"""
     latest = get_latest_version()
