@@ -5,20 +5,25 @@ from typing import Optional
 FILL = "█"
 EMPTY = "░"
 
-# Foreground colors
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
-RED = "\033[31m"
+# Muted 256-color palette — same semantic roles as standard ANSI
+# (green/yellow/red) but desaturated so the bar doesn't shout.
+#
+# Foreground — used for surrounding text (labels, separators, model name).
+GREEN = "\033[38;5;108m"   # sage green
+YELLOW = "\033[38;5;179m"  # muted gold
+RED = "\033[38;5;167m"     # dusty red
 RESET = "\033[0m"
 
-# Background colors
-BG_GREEN = "\033[42m"
-BG_YELLOW = "\033[43m"
-BG_RED = "\033[41m"
-BG_GRAY = "\033[100m"  # bright black (dark gray)
-FG_WHITE = "\033[97m"
-FG_BLACK = "\033[30m"
-DIM = "\033[2m"  # dim/faint text
+# Background — used to fill the battery bars. Matched in hue to the
+# foregrounds above, shifted one step darker so FG_WHITE text on top
+# remains legible.
+BG_GREEN = "\033[48;5;65m"    # muted sage
+BG_YELLOW = "\033[48;5;136m"  # dark gold
+BG_RED = "\033[48;5;131m"     # dusty rose
+BG_GRAY = "\033[48;5;238m"    # dark neutral gray (empty bar fill)
+FG_WHITE = "\033[38;5;253m"   # soft white (lower contrast than pure 97)
+FG_BLACK = "\033[38;5;235m"   # soft black
+DIM = "\033[2m"  # dim/faint text attribute
 
 DEFAULT_WARNING_THRESHOLD = 30.0
 DEFAULT_CRITICAL_THRESHOLD = 70.0
