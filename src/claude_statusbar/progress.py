@@ -250,4 +250,5 @@ def format_status_line(
     if pet_text:
         parts.append(colorize(pet_text, overall_color, use_color))
 
-    return " ".join(parts)
+    separator = colorize(" · ", overall_color, use_color)
+    return separator.join(parts)
