@@ -445,6 +445,9 @@ def parse_stdin_data() -> Dict[str, Any]:
         # Session ID
         result['session_id'] = data.get('session_id', '')
 
+        # Working directory (used by git_info for branch/worktree detection)
+        result['cwd'] = data.get('cwd', '')
+
         # Model
         model_obj = data.get('model', {})
         if isinstance(model_obj, dict):
