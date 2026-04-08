@@ -231,14 +231,6 @@ def format_status_line(
     if reset_time_7d:
         dim_7d += colorize(reset_time_7d, overall_color, use_color)
     parts.append(dim_7d)
-    # Branch + worktree share one cell — no separator between them.
-    git_tokens = []
-    if branch:
-        git_tokens.append(f"\ue0a0 {branch}")
-    if worktree:
-        git_tokens.append(f"⎇ {worktree}")
-    if git_tokens:
-        parts.append(colorize(" ".join(git_tokens), overall_color, use_color))
 
     # Model + effort share one cell — effort is dim-styled and attached
     # directly to the model name, no separator.
@@ -249,6 +241,15 @@ def format_status_line(
         else:
             model_cell += f" {effort}"
     parts.append(model_cell)
+
+    # Branch + worktree share one cell — no separator between them.
+    git_tokens = []
+    if branch:
+        git_tokens.append(f"\ue0a0 {branch}")
+    if worktree:
+        git_tokens.append(f"⎇ {worktree}")
+    if git_tokens:
+        parts.append(colorize(" ".join(git_tokens), overall_color, use_color))
     if bypass:
         parts.append(colorize("⚠️BYPASS", RED, use_color))
 
