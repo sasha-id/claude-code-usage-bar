@@ -106,7 +106,7 @@ def _load_default_branch(common_dir: Path, cwd: str) -> Optional[str]:
     key = str(common_dir)
     cache = _read_cache()
     cached = cache.get(key)
-    if cached:
+    if cached is not None:
         return cached
 
     output = _run_git(
@@ -131,9 +131,10 @@ def _load_default_branch(common_dir: Path, cwd: str) -> Optional[str]:
 
 def _read_cache() -> Dict[str, str]:
     try:
-        return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _write_cache(data: Dict[str, str]) -> None:
