@@ -759,10 +759,21 @@ def main(json_output: bool = False,
          reset_hour: Optional[int] = None, use_color: bool = True,
          detail: bool = False, pet_name: Optional[str] = None,
          show_pet: bool = True,
-         warning_threshold: float = 30.0, critical_threshold: float = 70.0):
+         warning_threshold: float = 30.0, critical_threshold: float = 70.0,
+         show_git: bool = True):
     """Main function"""
     from .pet import format_pet, get_countdown_emoji
     stdin_data = parse_stdin_data()
+
+    # Resolve git branch/worktree once per render. Deferred import keeps
+    # the cold path free of git_info when the user opts out.
+    if show_git:
+        from .git_info import get_git_info
+        git_info_result = get_git_info(stdin_data.get('cwd'))
+    else:
+        git_info_result = None
+    git_branch = git_info_result.branch if git_info_result else None
+    git_worktree = git_info_result.worktree if git_info_result else None
 
     try:
         if not json_output:
@@ -855,6 +866,7 @@ def main(json_output: bool = False,
                     warning_threshold=warning_threshold,
                     critical_threshold=critical_threshold,
                     effort=get_effort_label(model_id),
+                    branch=git_branch, worktree=git_worktree,
                 ))
         else:
             # No rate_limits yet — could be session start or old Claude Code
@@ -894,6 +906,7 @@ def main(json_output: bool = False,
                         warning_threshold=warning_threshold,
                         critical_threshold=critical_threshold,
                         effort=get_effort_label(model_id),
+                        branch=git_branch, worktree=git_worktree,
                     ))
             else:
                 # No stdin at all — not running inside Claude Code statusLine
