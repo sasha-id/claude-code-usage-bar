@@ -191,8 +191,10 @@ def get_git_info(cwd: Optional[str]) -> Optional[GitInfo]:
         common_dir = (cwd_path / common_dir).resolve()
 
     # Worktree detection: secondary worktree iff git-dir != git-common-dir.
+    # git_dir is the per-worktree bookkeeping dir <common-dir>/worktrees/<name>,
+    # so the final path component is the worktree name.
     if git_dir != common_dir:
-        worktree: Optional[str] = git_dir.parent.name
+        worktree: Optional[str] = git_dir.name
     else:
         worktree = None
 

@@ -65,7 +65,7 @@ Internals:
 
 - One subprocess call: `git -C <cwd> rev-parse --git-dir --git-common-dir --abbrev-ref HEAD`. Splits output into three lines. 200 ms timeout. (`--show-toplevel` is intentionally **not** included — it errors out on bare repos. We use `--git-common-dir` as the per-repo identifier instead, which works for bare repos and naturally shares the cache between worktrees of the same repo.)
 - If the call fails for any reason, return `None`.
-- Worktree name: if `git-dir != git-common-dir`, the worktree is secondary. Compute the name as `Path(git_dir).parent.name` (the directory name immediately above the worktree's `.git` file — equivalent to the segment after `.git/worktrees/`, but unambiguous even if some other path component happens to contain the string `worktrees`). Otherwise `worktree = None`.
+- Worktree name: if `git-dir != git-common-dir`, the worktree is secondary. `git rev-parse --git-dir` returns the per-worktree bookkeeping directory `<common-dir>/worktrees/<name>`, so compute the name as `Path(git_dir).name` — the final path component is `<name>`, unambiguous even if some path component higher up happens to be called `worktrees`. Otherwise `worktree = None`.
 - Default branch: call `_load_default_branch(common_dir_abs)`, where `common_dir_abs` is the absolute path to `--git-common-dir`.
 - Branch token: if `current_branch` equals the default, `branch = None`; otherwise `branch = current_branch`. Detached HEAD is detected by the literal sentinel `current_branch == _DETACHED_HEAD_SENTINEL` (a module-level constant equal to `"HEAD"`); in that case run a second subprocess `git -C <cwd> rev-parse --short HEAD` and use the resulting short SHA as the branch label (which is always non-default, so always rendered).
 
