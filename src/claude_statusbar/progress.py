@@ -226,21 +226,28 @@ def format_status_line(
     if reset_time_7d:
         dim_7d += colorize(reset_time_7d, overall_color, use_color)
     parts.append(dim_7d)
+    # Branch + worktree share one cell — no separator between them.
+    git_tokens = []
     if branch:
-        parts.append(colorize(f"\ue0a0 {branch}", overall_color, use_color))
+        git_tokens.append(f"\ue0a0 {branch}")
     if worktree:
-        parts.append(colorize(f"⎇ {worktree}", overall_color, use_color))
-    parts.append(colorize(model, overall_color, use_color))
+        git_tokens.append(f"⎇ {worktree}")
+    if git_tokens:
+        parts.append(colorize(" ".join(git_tokens), overall_color, use_color))
+
+    # Model + effort share one cell — effort is dim-styled and attached
+    # directly to the model name, no separator.
+    model_cell = colorize(model, overall_color, use_color)
     if effort:
         if use_color:
-            parts.append(f"{DIM}{effort}{RESET}")
+            model_cell += f" {DIM}{effort}{RESET}"
         else:
-            parts.append(effort)
+            model_cell += f" {effort}"
+    parts.append(model_cell)
     if bypass:
         parts.append(colorize("⚠️BYPASS", RED, use_color))
 
     if pet_text:
         parts.append(colorize(pet_text, overall_color, use_color))
 
-    separator = colorize(" | ", overall_color, use_color)
-    return separator.join(parts)
+    return " ".join(parts)
