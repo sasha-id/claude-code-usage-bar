@@ -133,7 +133,7 @@ def test_format_status_line_7d_countdown():
     assert "2h30m" in line
 
 def test_format_status_line_7d_no_countdown():
-    """When reset_time_7d is empty, no extra countdown after 7d bar."""
+    """When reset_time_7d is empty, no extra reset-time token after 7d bar."""
     line = format_status_line(
         msgs_pct=50, tkns_pct=None,
         reset_time="2h30m", model="Opus 4.6",
@@ -141,8 +141,8 @@ def test_format_status_line_7d_no_countdown():
         use_color=False,
     )
     assert "7d[" in line
-    # 5h has ⏰, 7d does not (no reset_time_7d)
-    assert "⏰2h30m" in line
+    # 5h renders its reset time; 7d does not (no reset_time_7d given)
+    assert "2h30m" in line
 
 def test_format_status_line_with_color():
     """Verify ANSI codes are present when use_color=True."""

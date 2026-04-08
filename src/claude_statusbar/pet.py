@@ -113,19 +113,3 @@ def format_pet(
     face = get_pet_face(mood)
     status = get_pet_status(mood, session_id)
     return f"{face} {name}:{status}"
-
-
-def get_countdown_emoji(minutes_to_reset: Optional[int]) -> str:
-    """Get countdown emoji based on proximity to reset.
-
-    Returns empty string when not in countdown range.
-    """
-    if minutes_to_reset is None:
-        return ""
-    if minutes_to_reset <= 1:
-        return " \U0001f389"  # party popper
-    if minutes_to_reset <= 10:
-        return " \u2728"  # sparkles
-    if minutes_to_reset <= 30:
-        return " \u26a1"  # lightning
-    return ""

@@ -763,7 +763,7 @@ def main(json_output: bool = False,
          warning_threshold: float = 30.0, critical_threshold: float = 70.0,
          show_git: bool = True):
     """Main function"""
-    from .pet import format_pet, get_countdown_emoji
+    from .pet import format_pet
     stdin_data = parse_stdin_data()
 
     # Resolve git branch/worktree once per render. Deferred import keeps
@@ -855,7 +855,6 @@ def main(json_output: bool = False,
                     pet_text = format_pet(
                         pet_pct, current_hour, session_id, minutes_to_reset, pet_name
                     )
-                countdown = get_countdown_emoji(minutes_to_reset)
 
                 print(format_status_line(
                     msgs_pct=msgs_pct, tkns_pct=None,
@@ -863,7 +862,7 @@ def main(json_output: bool = False,
                     weekly_pct=weekly_pct,
                     reset_time_7d=reset_time_7d,
                     bypass=bypass, use_color=use_color,
-                    pet_text=pet_text, countdown_emoji=countdown,
+                    pet_text=pet_text,
                     warning_threshold=warning_threshold,
                     critical_threshold=critical_threshold,
                     effort=get_effort_label(model_id),
