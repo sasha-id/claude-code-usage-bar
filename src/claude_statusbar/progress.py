@@ -182,6 +182,8 @@ def format_status_line(
     warning_threshold: Optional[float] = None,
     critical_threshold: Optional[float] = None,
     effort: str = "",
+    branch: Optional[str] = None,
+    worktree: Optional[str] = None,
 ) -> str:
     """Build the complete status bar string.
 
@@ -224,6 +226,10 @@ def format_status_line(
     if reset_time_7d:
         dim_7d += colorize(f"⏰{reset_time_7d}", overall_color, use_color)
     parts.append(dim_7d)
+    if branch:
+        parts.append(colorize(f"\ue0a0 {branch}", overall_color, use_color))
+    if worktree:
+        parts.append(colorize(f"⎇ {worktree}", overall_color, use_color))
     parts.append(colorize(model, overall_color, use_color))
     if effort:
         if use_color:
