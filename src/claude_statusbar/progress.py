@@ -202,7 +202,7 @@ def format_status_line(
         critical_threshold=critical_threshold,
     )
 
-    # 5h dimension with its reset time + countdown emoji
+    # 5h dimension with its reset time + countdown animation
     dim_5h = _build_dimension(
         "5h",
         msgs_pct,
@@ -211,7 +211,7 @@ def format_status_line(
         warning_threshold,
         critical_threshold,
     )
-    dim_5h += colorize(f"⏰{reset_time}{countdown_emoji}", overall_color, use_color)
+    dim_5h += colorize(f"{reset_time}{countdown_emoji}", overall_color, use_color)
     parts = [dim_5h]
 
     # 7d dimension with its reset time
@@ -224,7 +224,7 @@ def format_status_line(
         critical_threshold,
     )
     if reset_time_7d:
-        dim_7d += colorize(f"⏰{reset_time_7d}", overall_color, use_color)
+        dim_7d += colorize(reset_time_7d, overall_color, use_color)
     parts.append(dim_7d)
     if branch:
         parts.append(colorize(f"\ue0a0 {branch}", overall_color, use_color))
