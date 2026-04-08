@@ -73,6 +73,11 @@ Integration:
         help="Disable automatic update checks (or set CLAUDE_STATUSBAR_NO_UPDATE=1)",
     )
     parser.add_argument(
+        "--no-git",
+        action="store_true",
+        help="Disable git branch/worktree display in the status bar (or set CLAUDE_STATUSBAR_NO_GIT=1)",
+    )
+    parser.add_argument(
         "--pet-name",
         type=str,
         help="Set a custom name for the status bar pet (default: random per session)",
@@ -168,6 +173,7 @@ Integration:
         print(str(exc), file=sys.stderr)
         return 1
 
+    show_git = not (args.no_git or env_bool("CLAUDE_STATUSBAR_NO_GIT"))
     try:
         pet_name = args.pet_name or os.environ.get("CLAUDE_PET_NAME")
         statusbar_main(
@@ -179,6 +185,7 @@ Integration:
             show_pet=show_pet,
             warning_threshold=warning_threshold,
             critical_threshold=critical_threshold,
+            show_git=show_git,
         )
         return 0
     except KeyboardInterrupt:
