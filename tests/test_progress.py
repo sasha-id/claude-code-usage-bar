@@ -154,3 +154,63 @@ def test_format_status_line_with_color():
     )
     assert "\033[" in line
     assert "\033[0m" in line
+
+
+from claude_statusbar.progress import (
+    build_effort_segment,
+    THINKING_GLYPH,
+    FAST_GLYPH,
+)
+
+
+def test_effort_segment_empty_when_nothing():
+    assert build_effort_segment(None, False, False, use_color=False) == ""
+
+
+def test_effort_segment_plain_level():
+    assert build_effort_segment("high", thinking_enabled=False,
+                                fast_mode=False, use_color=False) == "high"
+
+
+def test_effort_segment_medium_abbreviates():
+    assert build_effort_segment("medium", thinking_enabled=False,
+                                fast_mode=False, use_color=False) == "med"
+
+
+def test_effort_segment_thinking_prefixes_glyph():
+    seg = build_effort_segment("xhigh", thinking_enabled=True,
+                               fast_mode=False, use_color=False)
+    assert seg == f"{THINKING_GLYPH}xhigh"
+
+
+def test_effort_segment_fast_mode_appends_glyph():
+    seg = build_effort_segment("max", thinking_enabled=True,
+                               fast_mode=True, use_color=False)
+    assert seg == f"{THINKING_GLYPH}max{FAST_GLYPH}"
+
+
+def test_effort_segment_fast_without_effort_still_shows():
+    """Fast mode shows even when the model reports no effort level."""
+    assert build_effort_segment(None, thinking_enabled=False,
+                                fast_mode=True, use_color=False) == FAST_GLYPH
+
+
+def test_format_status_line_includes_effort():
+    line = format_status_line(
+        msgs_pct=50, tkns_pct=None,
+        reset_time="2h30m", model="Opus 4.8",
+        weekly_pct=30, use_color=False,
+        effort_level="xhigh", thinking_enabled=True, fast_mode=False,
+    )
+    assert f"Opus 4.8 {THINKING_GLYPH}xhigh" in line
+
+
+def test_format_status_line_no_effort_leaves_model_clean():
+    line = format_status_line(
+        msgs_pct=50, tkns_pct=None,
+        reset_time="2h30m", model="Opus 4.8",
+        weekly_pct=30, use_color=False,
+    )
+    assert "Opus 4.8" in line
+    assert THINKING_GLYPH not in line
+    assert FAST_GLYPH not in line

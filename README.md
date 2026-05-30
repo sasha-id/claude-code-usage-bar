@@ -7,7 +7,7 @@ It shows your current Claude.ai rate-limit usage, reset timers, context window u
 ## What it shows
 
 ```
-5h[███38%░░░░]⏰2h14m | 7d[███87%███░]⏰3d05h | Opus 4.6(90.0k/1.0M) | ᓚᘏᗢ Giga:working!
+5h[███38%░░░░]⏰2h14m | 7d[███87%███░]⏰3d05h | Opus 4.8(90.0k/1.0M) ✳xhigh↯ | ᓚᘏᗢ Giga:working!
 ```
 
 | Segment | Meaning |
@@ -16,8 +16,12 @@ It shows your current Claude.ai rate-limit usage, reset timers, context window u
 | `⏰2h14m` | Time until the 5-hour window resets |
 | `7d[███87%███░]` | 7-day rate-limit usage |
 | `⏰3d05h` | Time until the 7-day window resets |
-| `Opus 4.6(90.0k/1.0M)` | Model name plus current context usage |
+| `Opus 4.8(90.0k/1.0M)` | Model name plus current context usage |
+| `✳xhigh` | Reasoning effort (`low`/`med`/`high`/`xhigh`/`max`); `✳` shows when extended thinking is on |
+| `↯` | Fast mode is active |
 | `ᓚᘏᗢ Giga:working!` | Optional status-bar pet |
+
+The effort/thinking/fast indicators come from the live `effort.level`, `thinking.enabled`, and `fast_mode` fields in the Claude Code statusLine payload (requires Claude Code `v2.1.119+`); they update mid-session and are hidden for models that don't report an effort level.
 
 Colors default to green / yellow / red at `30%` and `70%`, and can be customized.
 

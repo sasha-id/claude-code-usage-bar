@@ -108,6 +108,17 @@ def parse_stdin_data() -> Dict[str, Any]:
         # Version
         result['claude_version'] = data.get('version', '')
 
+        # Reasoning effort / thinking / fast-mode (Claude Code >= v2.1.119).
+        # These are the LIVE session values — effort.level updates on mid-session
+        # /effort changes. `effort` is absent for models without effort support.
+        effort = data.get('effort', {})
+        if isinstance(effort, dict) and effort.get('level'):
+            result['effort_level'] = effort.get('level')
+        thinking = data.get('thinking', {})
+        if isinstance(thinking, dict):
+            result['thinking_enabled'] = bool(thinking.get('enabled'))
+        result['fast_mode'] = bool(data.get('fast_mode'))
+
         # Mark that we have valid stdin data
         result['_has_stdin'] = True
 
@@ -315,6 +326,9 @@ def main(json_output: bool = False,
                     },
                     "meta": {"model": model_id, "display_name": display_name,
                              "reset_time": reset_time, "reset_time_7d": reset_time_7d, "bypass": bypass,
+                             "effort": stdin_data.get('effort_level'),
+                             "thinking": stdin_data.get('thinking_enabled', False),
+                             "fast_mode": stdin_data.get('fast_mode', False),
                              },
                 }))
             else:
@@ -348,6 +362,9 @@ def main(json_output: bool = False,
                     pet_text=pet_text,
                     warning_threshold=warning_threshold,
                     critical_threshold=critical_threshold,
+                    effort_level=stdin_data.get('effort_level'),
+                    thinking_enabled=stdin_data.get('thinking_enabled', False),
+                    fast_mode=stdin_data.get('fast_mode', False),
                     branch=git_branch, worktree=git_worktree,
                 ))
         else:
@@ -387,6 +404,9 @@ def main(json_output: bool = False,
                         pet_text=pet_text,
                         warning_threshold=warning_threshold,
                         critical_threshold=critical_threshold,
+                        effort_level=stdin_data.get('effort_level'),
+                        thinking_enabled=stdin_data.get('thinking_enabled', False),
+                        fast_mode=stdin_data.get('fast_mode', False),
                         branch=git_branch, worktree=git_worktree,
                     ))
             else:

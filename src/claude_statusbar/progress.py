@@ -23,6 +23,13 @@ BG_RED = "\033[48;5;131m"     # dusty rose
 BG_GRAY = "\033[48;5;238m"    # dark neutral gray (empty bar fill)
 FG_WHITE = "\033[38;5;253m"   # soft white (lower contrast than pure 97)
 FG_BLACK = "\033[38;5;235m"   # soft black
+DIM = "\033[2m"  # dim/faint text attribute (secondary info: effort, thinking)
+
+# Effort levels are shown verbatim except medium, abbreviated to keep the
+# cell compact. Values mirror the official effort.level enum from Claude Code.
+_EFFORT_LABELS = {"medium": "med"}
+THINKING_GLYPH = "✳"  # extended thinking is on
+FAST_GLYPH = "↯"      # fast mode is on (matches Claude Code's ↯ indicator)
 
 DEFAULT_WARNING_THRESHOLD = 30.0
 DEFAULT_CRITICAL_THRESHOLD = 70.0
@@ -171,6 +178,34 @@ def _build_dimension(label: str, pct: Optional[float],
     )
 
 
+def build_effort_segment(
+    effort_level: Optional[str],
+    thinking_enabled: bool = False,
+    fast_mode: bool = False,
+    use_color: bool = True,
+) -> str:
+    """Render the dim effort/thinking/fast indicator, e.g. "✳xhigh↯".
+
+    Sourced from the live stdin payload (effort.level, thinking.enabled,
+    fast_mode). Returns "" when there's nothing to show. The thinking glyph
+    decorates the effort level; the fast glyph is appended independently so
+    fast mode still shows on models that don't report an effort level.
+    """
+    label = ""
+    if effort_level:
+        label = _EFFORT_LABELS.get(effort_level.lower(), effort_level)
+
+    text = ""
+    if label:
+        text = f"{THINKING_GLYPH}{label}" if thinking_enabled else label
+    if fast_mode:
+        text += FAST_GLYPH
+
+    if not text:
+        return ""
+    return f"{DIM}{text}{RESET}" if use_color else text
+
+
 def format_status_line(
     msgs_pct: Optional[float],
     tkns_pct: Optional[float],
@@ -184,6 +219,9 @@ def format_status_line(
     pet_text: str = "",
     warning_threshold: Optional[float] = None,
     critical_threshold: Optional[float] = None,
+    effort_level: Optional[str] = None,
+    thinking_enabled: bool = False,
+    fast_mode: bool = False,
     branch: Optional[str] = None,
     worktree: Optional[str] = None,
 ) -> str:
@@ -229,8 +267,14 @@ def format_status_line(
         dim_7d += colorize(reset_time_7d, overall_color, use_color)
     parts.append(dim_7d)
 
-    # Model cell.
-    parts.append(colorize(model, overall_color, use_color))
+    # Model cell, with the dim effort/thinking/fast indicator attached.
+    model_cell = colorize(model, overall_color, use_color)
+    effort_seg = build_effort_segment(
+        effort_level, thinking_enabled, fast_mode, use_color
+    )
+    if effort_seg:
+        model_cell += f" {effort_seg}"
+    parts.append(model_cell)
 
     # Branch + worktree share one cell — no separator between them.
     git_tokens = []
