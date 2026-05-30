@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Claude Code Status Bar Monitor - Final Fixed Version
-Resolves dependency issues, ensuring operation in any environment
+Claude Code Status Bar Monitor.
+
+Rate-limit, context-window, and model data all arrive via the stdin payload
+that Claude Code sends to custom `statusLine` commands. This module parses
+that payload and renders the status line — no subprocesses, no file scans on
+the hot path.
 """
 
 import json
@@ -9,412 +13,15 @@ import re
 import sys
 import logging
 import os
-import subprocess
-import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from .cache import read_cache, read_cache_stale, write_cache, refresh_cache_background
 from .progress import format_status_line
 
 # Suppress log output
 logging.basicConfig(level=logging.ERROR)
 
-def try_original_analysis() -> Optional[Dict[str, Any]]:
-    """Try to use the installed claude-monitor package"""
-    try:
-        
-        # Check if claude-monitor is installed
-        claude_monitor_cmd = shutil.which('claude-monitor')
-        if not claude_monitor_cmd:
-            # Try other command aliases
-            for cmd in ['cmonitor', 'ccmonitor', 'ccm']:
-                claude_monitor_cmd = shutil.which(cmd)
-                if claude_monitor_cmd:
-                    break
-        
-        if not claude_monitor_cmd:
-            logging.info("claude-monitor not found. Install with: uv tool install claude-monitor")
-            return None
-        
-        # Find the Python interpreter used by claude-monitor
-        # Check common installation paths
-        possible_paths = [
-            Path.home() / ".local/share/uv/tools/claude-monitor/bin/python",
-            Path.home() / ".uv/tools/claude-monitor/bin/python",
-            Path.home() / ".local/pipx/venvs/claude-monitor/bin/python",  # pipx installation
-        ]
-        
-        claude_python = None
-        for path in possible_paths:
-            if path.exists():
-                claude_python = str(path)
-                break
-        
-        if not claude_python:
-            # Try to extract from the shebang of claude-monitor script
-            try:
-                with open(claude_monitor_cmd, 'r') as f:
-                    first_line = f.readline()
-                    if first_line.startswith('#!'):
-                        claude_python = first_line[2:].strip()
-            except:
-                pass
-        
-        if not claude_python:
-            logging.info("Could not find claude-monitor Python interpreter")
-            return None
-        
-        # Use subprocess to run analysis with the correct Python
-        code = """
-import json
-import sys
-try:
-    # Version compatibility check
-    import claude_monitor
-    version = getattr(claude_monitor, '__version__', 'unknown')
-    
-    from claude_monitor.data.analysis import analyze_usage
-    from claude_monitor.core.plans import get_token_limit
-    
-    result = analyze_usage(hours_back=192, quick_start=False)
-    blocks = result.get('blocks', [])
-    
-    if not blocks:
-        print(json.dumps(None))
-        sys.exit(0)
-    
-    # Get active sessions
-    active_blocks = [b for b in blocks if b.get('isActive', False)]
-    if not active_blocks:
-        print(json.dumps(None))
-        sys.exit(0)
-    
-    current_block = active_blocks[0]
-    
-    # Get P90 limit with compatibility handling
-    try:
-        token_limit = get_token_limit('custom', blocks)
-    except TypeError:
-        # Try old API signature
-        try:
-            token_limit = get_token_limit('custom')
-        except:
-            token_limit = 113505
-    except:
-        token_limit = 113505
-    
-    # Calculate dynamic cost limit using P90 method similar to claude-monitor
-    try:
-        # Get all historical costs from blocks for P90 calculation
-        all_costs = []
-        for block in blocks:
-            cost = block.get('costUSD', 0)
-            if cost > 0:
-                all_costs.append(cost)
-        
-        # Also collect message counts for P90 calculation
-        all_messages = []
-        for block in blocks:
-            msg_count = block.get('sentMessagesCount', len(block.get('entries', [])))
-            if msg_count > 0:
-                all_messages.append(msg_count)
-        
-        if len(all_costs) >= 5:
-            # Use P90 calculation similar to claude-monitor
-            all_costs.sort()
-            all_messages.sort()
-            p90_index = int(len(all_costs) * 0.9)
-            p90_cost = all_costs[min(p90_index, len(all_costs) - 1)]
-            # Calculate message limit using P90 method
-            if all_messages:
-                p90_msg_index = int(len(all_messages) * 0.9)
-                p90_messages = all_messages[min(p90_msg_index, len(all_messages) - 1)]
-                message_limit = max(int(p90_messages * 1.2), 100)  # Similar to cost calculation
-            else:
-                message_limit = 250  # Default based on your example
-            
-            # Apply similar logic to claude-monitor (seems to use a different multiplier)
-            cost_limit = max(p90_cost * 1.004, 50.0)  # Adjusted to match observed behavior
-        else:
-            # Fallback to static limit
-            from claude_monitor.core.plans import get_cost_limit
-            cost_limit = get_cost_limit('custom')
-            message_limit = 250  # Default
-    except:
-        cost_limit = 90.26  # fallback
-    
-    # Handle different field name conventions for compatibility
-    total_tokens = (current_block.get('totalTokens', 0) or 
-                   current_block.get('total_tokens', 0) or 0)
-    cost_usd = (current_block.get('costUSD', 0.0) or 
-               current_block.get('cost_usd', 0.0) or 
-               current_block.get('cost', 0.0) or 0.0)
-    entries = current_block.get('entries', []) or []
-    messages_count = current_block.get('sentMessagesCount', len(entries))
-    is_active = current_block.get('isActive', current_block.get('is_active', False))
-    
-    # Collect models used in current block
-    models = current_block.get('models', [])
-
-    # 7-day totals across ALL non-gap blocks
-    from datetime import datetime, timedelta, timezone
-    week_ago = datetime.now(timezone.utc) - timedelta(days=7)
-    weekly_tokens = 0
-    weekly_msgs = 0
-    weekly_cost = 0.0
-    for b in blocks:
-        if b.get('isGap', False):
-            continue
-        start = b.get('startTime', '')
-        if isinstance(start, str) and start:
-            if start.endswith('Z'):
-                start = start[:-1] + '+00:00'
-            try:
-                bt = datetime.fromisoformat(start)
-                if bt >= week_ago:
-                    weekly_tokens += b.get('totalTokens', 0) or 0
-                    weekly_msgs += b.get('sentMessagesCount', 0) or 0
-                    weekly_cost += b.get('costUSD', 0.0) or 0.0
-            except:
-                pass
-
-    output = {
-        'total_tokens': total_tokens,
-        'token_limit': token_limit,
-        'cost_usd': cost_usd,
-        'cost_limit': cost_limit,
-        'messages_count': messages_count,
-        'message_limit': message_limit,
-        'entries_count': len(entries),
-        'is_active': is_active,
-        'plan_type': 'CUSTOM',
-        'source': 'original',
-        'models': models,
-        'weekly_tokens': weekly_tokens,
-        'weekly_msgs': weekly_msgs,
-        'weekly_cost': weekly_cost,
-    }
-    print(json.dumps(output))
-except Exception as e:
-    print(json.dumps(None))
-    sys.exit(1)
-"""
-        
-        # Run the code with the claude-monitor Python interpreter
-        result = subprocess.run(
-            [claude_python, '-c', code],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        
-        if result.returncode == 0 and result.stdout:
-            data = json.loads(result.stdout.strip())
-            if data:
-                return data
-        
-        return None
-        
-    except Exception as e:
-        logging.error(f"Original analysis failed: {e}")
-        return None
-
-def direct_data_analysis() -> Optional[Dict[str, Any]]:
-    """Directly analyze Claude data files, completely independent implementation"""
-    try:
-        def build_candidate_paths() -> List[Path]:
-            """Collect plausible data directories in priority order."""
-            paths: List[Path] = []
-            
-            # Respect Claude Code env override
-            env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-            if env_dir:
-                env_path = Path(env_dir).expanduser()
-                if env_path.name == ".claude":
-                    paths.append(env_path)
-                    paths.append(env_path / "projects")
-                else:
-                    paths.append(env_path / ".claude")
-                    paths.append(env_path / ".claude" / "projects")
-            
-            # Running from inside .claude
-            cwd = Path.cwd()
-            if cwd.name == ".claude":
-                paths.append(cwd)
-                paths.append(cwd / "projects")
-            
-            # Standard locations
-            paths.extend([
-                Path.home() / '.claude' / 'projects',
-                Path.home() / '.config' / 'claude' / 'projects',
-                Path.home() / '.claude',
-            ])
-            
-            # Deduplicate while preserving order
-            seen = set()
-            unique_paths: List[Path] = []
-            for p in paths:
-                if p not in seen:
-                    unique_paths.append(p)
-                    seen.add(p)
-            return unique_paths
-
-        data_path = None
-        for path in build_candidate_paths():
-            if path.exists() and path.is_dir():
-                data_path = path
-                break
-        
-        if not data_path:
-            return None
-        
-        # Collect data from the last 5 hours (simulate session window)
-        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=5)
-        current_session_data = []
-        
-        # Collect historical data for P90 calculation
-        history_cutoff = datetime.now(timezone.utc) - timedelta(days=8)
-        all_sessions = []
-        current_session_tokens = 0
-        current_session_cost = 0.0
-        last_time = None
-        
-        # Read all JSONL files
-        for jsonl_file in sorted(data_path.rglob("*.jsonl"), key=lambda f: f.stat().st_mtime):
-            try:
-                with open(jsonl_file, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        
-                        try:
-                            data = json.loads(line)
-                            
-                            # Parse timestamp
-                            timestamp_str = data.get('timestamp', '')
-                            if not timestamp_str:
-                                continue
-                            
-                            if timestamp_str.endswith('Z'):
-                                timestamp_str = timestamp_str[:-1] + '+00:00'
-                            
-                            timestamp = datetime.fromisoformat(timestamp_str)
-                            
-                            # Extract usage data
-                            usage = data.get('usage', {})
-                            if not usage and 'message' in data and isinstance(data['message'], dict):
-                                usage = data['message'].get('usage', {})
-                            
-                            if not usage:
-                                continue
-                            
-                            # Calculate tokens
-                            input_tokens = usage.get('input_tokens', 0)
-                            output_tokens = usage.get('output_tokens', 0)
-                            cache_creation = usage.get('cache_creation_input_tokens', 0)
-                            cache_read = usage.get('cache_read_input_tokens', 0)
-                            
-                            total_tokens = input_tokens + output_tokens + cache_creation
-                            
-                            if total_tokens == 0:
-                                continue
-                            
-                            # Estimate cost (simplified pricing model)
-                            # Based on Sonnet 3.5 pricing: input $3/M tokens, output $15/M tokens
-                            cost = (input_tokens * 3 + output_tokens * 15 + cache_creation * 3.75) / 1000000
-                            
-                            entry = {
-                                'timestamp': timestamp,
-                                'total_tokens': total_tokens,
-                                'cost': cost,
-                                'input_tokens': input_tokens,
-                                'output_tokens': output_tokens,
-                                'cache_creation': cache_creation,
-                                'cache_read': cache_read
-                            }
-                            
-                            # Current 5-hour session data
-                            if timestamp >= cutoff_time:
-                                current_session_data.append(entry)
-                            
-                            # Historical session grouping (for P90 calculation)
-                            if timestamp >= history_cutoff:
-                                if (last_time is None or 
-                                    (timestamp - last_time).total_seconds() > 5 * 3600):
-                                    # Save previous session
-                                    if current_session_tokens > 0:
-                                        all_sessions.append({
-                                            'tokens': current_session_tokens,
-                                            'cost': current_session_cost
-                                        })
-                                    # Start new session
-                                    current_session_tokens = total_tokens
-                                    current_session_cost = cost
-                                else:
-                                    # Continue current session
-                                    current_session_tokens += total_tokens
-                                    current_session_cost += cost
-                                
-                                last_time = timestamp
-                        
-                        except (json.JSONDecodeError, ValueError, TypeError):
-                            continue
-                            
-            except Exception:
-                continue
-        
-        # Save last session
-        if current_session_tokens > 0:
-            all_sessions.append({
-                'tokens': current_session_tokens,
-                'cost': current_session_cost
-            })
-        
-        if not current_session_data:
-            return None
-        
-        # Calculate current session statistics
-        total_tokens = sum(e['total_tokens'] for e in current_session_data)
-        total_cost = sum(e['cost'] for e in current_session_data)
-        
-        # Calculate P90 limit
-        if len(all_sessions) >= 5:
-            session_tokens = [s['tokens'] for s in all_sessions]
-            session_costs = [s['cost'] for s in all_sessions]
-            session_tokens.sort()
-            session_costs.sort()
-            
-            p90_index = int(len(session_tokens) * 0.9)
-            token_limit = max(session_tokens[min(p90_index, len(session_tokens) - 1)], 19000)
-            cost_limit = max(session_costs[min(p90_index, len(session_costs) - 1)] * 1.2, 18.0)
-        else:
-            # Default limits
-            if total_tokens > 100000:
-                token_limit, cost_limit = 220000, 140.0
-            elif total_tokens > 50000:
-                token_limit, cost_limit = 88000, 35.0
-            else:
-                token_limit, cost_limit = 19000, 18.0
-        
-        return {
-            'total_tokens': total_tokens,
-            'token_limit': int(token_limit),
-            'cost_usd': total_cost,
-            'cost_limit': cost_limit,
-            'messages_count': len(current_session_data),  # Each entry is a message
-            'message_limit': 250,  # Default fallback
-            'entries_count': len(current_session_data),
-            'is_active': True,
-            'plan_type': 'CUSTOM' if len(all_sessions) >= 5 else 'AUTO',
-            'source': 'direct'
-        }
-        
-    except Exception as e:
-        logging.error(f"Direct analysis failed: {e}")
-        return None
 
 def parse_stdin_data() -> Dict[str, Any]:
     """Parse JSON data injected by Claude Code via stdin.
@@ -501,7 +108,6 @@ def parse_stdin_data() -> Dict[str, Any]:
         # Version
         result['claude_version'] = data.get('version', '')
 
-
         # Mark that we have valid stdin data
         result['_has_stdin'] = True
 
@@ -517,7 +123,6 @@ def is_bypass_permissions_active() -> bool:
     use a best-effort multi-source approach:
       1. CLAUDE_SKIP_PERMISSIONS env var (set by some wrappers)
       2. settings.json defaultMode == 'bypassPermissions'
-      3. skipDangerousModePermissionPrompt is True AND any bypass hint found
     """
     # 1. Explicit env var
     env_val = os.environ.get('CLAUDE_SKIP_PERMISSIONS', '').lower()
@@ -538,24 +143,6 @@ def is_bypass_permissions_active() -> bool:
     return False
 
 
-def get_effort_label(model_id: str) -> str:
-    """Read effortLevel from settings. For Opus, show 'high/max' when set to high."""
-    effort = ''
-    try:
-        settings_path = Path.home() / '.claude' / 'settings.json'
-        if settings_path.exists():
-            with open(settings_path, 'r', encoding='utf-8') as f:
-                settings = json.load(f)
-            effort = settings.get('effortLevel', '')
-    except Exception:
-        pass
-    if 'opus' in model_id.lower():
-        if effort == 'high':
-            return 'high/max'
-        return effort or 'max'
-    return effort
-
-
 def get_current_model(stdin_data: Optional[Dict[str, Any]] = None) -> tuple[str, str]:
     """Return (model_id, display_name), using stdin data when available."""
     sd = stdin_data or {}
@@ -565,9 +152,14 @@ def get_current_model(stdin_data: Optional[Dict[str, Any]] = None) -> tuple[str,
         display_name = model if model != 'unknown' else 'Unknown'
     return model, display_name
 
+
 def calculate_reset_time(reset_hour: Optional[int] = None) -> str:
-    """Calculate time until session reset (5-hour rolling window or custom hour)"""
-    # If user pins a reset hour, honor it before any external calls
+    """Estimate time until the 5-hour window resets.
+
+    Only used in the error-path fallback; the happy path derives reset times
+    directly from the official `resets_at` timestamps in the stdin payload.
+    """
+    # If the user pins a reset hour, honor it.
     if reset_hour is not None and 0 <= reset_hour <= 23:
         now = datetime.now()
         target = now.replace(hour=reset_hour, minute=0, second=0, microsecond=0)
@@ -579,105 +171,18 @@ def calculate_reset_time(reset_hour: Optional[int] = None) -> str:
         mins = total_minutes % 60
         return f"{hours}h {mins:02d}m"
 
-    try:
-        
-        # Try the same method as try_original_analysis to get session data
-        claude_monitor_cmd = shutil.which('claude-monitor')
-        if claude_monitor_cmd:
-            # Find Python interpreter
-            possible_paths = [
-                Path.home() / ".local/share/uv/tools/claude-monitor/bin/python",
-                Path.home() / ".uv/tools/claude-monitor/bin/python",
-                Path.home() / ".local/pipx/venvs/claude-monitor/bin/python",  # pipx installation
-            ]
-            
-            claude_python = None
-            for path in possible_paths:
-                if path.exists():
-                    claude_python = str(path)
-                    break
-            
-            if not claude_python:
-                try:
-                    with open(claude_monitor_cmd, 'r') as f:
-                        first_line = f.readline()
-                        if first_line.startswith('#!'):
-                            claude_python = first_line[2:].strip()
-                except:
-                    pass
-            
-            if claude_python:
-                code = """
-import json
-from datetime import datetime, timedelta, timezone
-try:
-    from claude_monitor.data.analysis import analyze_usage
-    
-    result = analyze_usage(hours_back=192, quick_start=False)
-    blocks = result.get('blocks', [])
-    
-    if blocks:
-        active_blocks = [b for b in blocks if b.get('isActive', False)]
-        if active_blocks:
-            current_block = active_blocks[0]
-            start_time = current_block.get('startTime')
-            
-            if start_time:
-                # Parse start time
-                if isinstance(start_time, str):
-                    if start_time.endswith('Z'):
-                        start_time = start_time[:-1] + '+00:00'
-                    session_start = datetime.fromisoformat(start_time)
-                else:
-                    session_start = start_time
-                
-                # Session lasts 5 hours
-                session_end = session_start + timedelta(hours=5)
-                now = datetime.now(timezone.utc)
-                
-                if session_end > now:
-                    diff = session_end - now
-                    total_minutes = int(diff.total_seconds() / 60)
-                    
-                    if total_minutes > 60:
-                        hours = total_minutes // 60
-                        mins = total_minutes % 60
-                        print(f"{hours}h {mins:02d}m")
-                    else:
-                        print(f"{total_minutes}m")
-                    import sys
-                    sys.exit(0)
-except:
-    pass
-print("")
-"""
-                result = subprocess.run(
-                    [claude_python, '-c', code],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                
-                if result.returncode == 0 and result.stdout.strip():
-                    return result.stdout.strip()
-    except:
-        pass
-    
-    # Fallback: estimate reset time (assume session started within the last 5 hours)
+    # Fallback: assume a fixed 2 PM reset (matches the original project default).
     now = datetime.now()
-    # Assume reset time is 2 PM (consistent with original project display)
     today_2pm = now.replace(hour=14, minute=0, second=0, microsecond=0)
     tomorrow_2pm = today_2pm + timedelta(days=1)
-    
-    # Choose next 2 PM
     next_reset = tomorrow_2pm if now >= today_2pm else today_2pm
     diff = next_reset - now
-    
+
     total_minutes = int(diff.total_seconds() / 60)
     hours = total_minutes // 60
     mins = total_minutes % 60
-    
     return f"{hours}h {mins:02d}m"
+
 
 def check_for_updates(session_id: str = ''):
     """Kick off a background update check once per new session.
@@ -723,28 +228,6 @@ def check_for_updates(session_id: str = ''):
     except Exception:
         # Never let an update-check error bubble up into the statusline.
         pass
-
-def build_json_output(usage_data: Dict[str, Any], reset_time: str, model: str, display_name: str) -> Dict[str, Any]:
-    """Create machine-readable payload."""
-    return {
-        "success": True,
-        "usage": {
-            "total_tokens": usage_data.get("total_tokens", 0),
-            "token_limit": usage_data.get("token_limit", 0),
-            "cost_usd": usage_data.get("cost_usd", 0.0),
-            "cost_limit": usage_data.get("cost_limit", 0.0),
-            "messages_count": usage_data.get("messages_count", 0),
-            "message_limit": usage_data.get("message_limit", 0),
-            "plan_type": usage_data.get("plan_type"),
-            "source": usage_data.get("source", "unknown"),
-        },
-        "meta": {
-            "model": model,
-            "display_name": display_name,
-            "reset_time": reset_time,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-        },
-    }
 
 
 def format_number(num: float) -> str:
@@ -865,7 +348,6 @@ def main(json_output: bool = False,
                     pet_text=pet_text,
                     warning_threshold=warning_threshold,
                     critical_threshold=critical_threshold,
-                    effort=get_effort_label(model_id),
                     branch=git_branch, worktree=git_worktree,
                 ))
         else:
@@ -905,7 +387,6 @@ def main(json_output: bool = False,
                         pet_text=pet_text,
                         warning_threshold=warning_threshold,
                         critical_threshold=critical_threshold,
-                        effort=get_effort_label(model_id),
                         branch=git_branch, worktree=git_worktree,
                     ))
             else:
@@ -939,8 +420,8 @@ def main(json_output: bool = False,
                 pet_text=pet_text,
                 warning_threshold=warning_threshold,
                 critical_threshold=critical_threshold,
-                effort=get_effort_label(model_id),
             ))
+
 
 if __name__ == '__main__':
     main()

@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- Core code lives in `src/claude_statusbar`: `core.py` handles usage calculation and model lookup, `cli.py` provides the entrypoint (`claude-statusbar`, `cstatus`, `cs`), and `updater.py` manages self-upgrades.
+- Core code lives in `src/claude_statusbar`: `core.py` parses the Claude Code stdin payload and renders the status line, `progress.py` builds the bars, `git_info.py` resolves branch/worktree, `cli.py` provides the entrypoint (`claude-statusbar`, `cstatus`, `cs`), and `updater.py` manages self-upgrades.
 - Packaging metadata is in `pyproject.toml`; built artifacts land in `dist/` (keep generated wheels/sdists out of commits unless releasing).
 - Installer helpers: `install.sh` and `web-install.sh` for one-line setup, `uninstall.sh` for cleanup, and `publish.sh` for PyPI uploads. Demo and promotional assets sit in `demo/`, `img.png`, and `promotion/`.
 
@@ -13,7 +13,7 @@
 - Install optional dependency for richer data: `python -m claude_statusbar.cli --install-deps` then follow prompts for `claude-monitor`.
 
 ## Coding Style & Naming Conventions
-- Python 3.9+; follow PEP 8 with 4-space indentation and short, imperative helper names (`get_current_model`, `try_original_analysis`).
+- Python 3.9+; follow PEP 8 with 4-space indentation and short, imperative helper names (`get_current_model`, `parse_stdin_data`).
 - Keep dependencies minimal (stdlib only by default); guard optional imports and subprocess calls.
 - Prefer pure functions with clear return types; add `typing` hints where missing and keep logging quiet (current default ERROR).
 

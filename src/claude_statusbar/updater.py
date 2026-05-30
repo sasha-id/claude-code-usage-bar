@@ -138,8 +138,8 @@ def auto_upgrade() -> bool:
 def spawn_update_check_background() -> None:
     """Fire-and-forget: run check_and_upgrade in a detached subprocess.
 
-    Mirrors cache.refresh_cache_background(). The main process returns
-    immediately so Claude Code's statusline never blocks on PyPI or on
+    The main process returns immediately so Claude Code's statusline never
+    blocks on PyPI or on
     `uv tool install`. Any upgrade takes effect at the next statusline
     invocation.
     """

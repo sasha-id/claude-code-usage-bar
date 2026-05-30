@@ -23,7 +23,6 @@ BG_RED = "\033[48;5;131m"     # dusty rose
 BG_GRAY = "\033[48;5;238m"    # dark neutral gray (empty bar fill)
 FG_WHITE = "\033[38;5;253m"   # soft white (lower contrast than pure 97)
 FG_BLACK = "\033[38;5;235m"   # soft black
-DIM = "\033[2m"  # dim/faint text attribute
 
 DEFAULT_WARNING_THRESHOLD = 30.0
 DEFAULT_CRITICAL_THRESHOLD = 70.0
@@ -185,7 +184,6 @@ def format_status_line(
     pet_text: str = "",
     warning_threshold: Optional[float] = None,
     critical_threshold: Optional[float] = None,
-    effort: str = "",
     branch: Optional[str] = None,
     worktree: Optional[str] = None,
 ) -> str:
@@ -231,15 +229,8 @@ def format_status_line(
         dim_7d += colorize(reset_time_7d, overall_color, use_color)
     parts.append(dim_7d)
 
-    # Model + effort share one cell — effort is dim-styled and attached
-    # directly to the model name, no separator.
-    model_cell = colorize(model, overall_color, use_color)
-    if effort:
-        if use_color:
-            model_cell += f" {DIM}{effort}{RESET}"
-        else:
-            model_cell += f" {effort}"
-    parts.append(model_cell)
+    # Model cell.
+    parts.append(colorize(model, overall_color, use_color))
 
     # Branch + worktree share one cell — no separator between them.
     git_tokens = []

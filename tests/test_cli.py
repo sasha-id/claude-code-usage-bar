@@ -3,7 +3,7 @@ import sys
 import claude_statusbar.cli as cli
 
 
-def test_cli_passes_hide_pet_effort_and_thresholds(monkeypatch):
+def test_cli_passes_hide_pet_and_thresholds(monkeypatch):
     captured = {}
 
     def fake_statusbar_main(**kwargs):
