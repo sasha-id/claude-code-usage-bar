@@ -13,6 +13,7 @@ import re
 import sys
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -134,6 +135,8 @@ def _fetch_kimi_usage(base_url: str, token: str) -> dict:
             if not isinstance(item, dict):
                 continue
             window = item.get("window") or {}
+            if not isinstance(window, dict):
+                continue
             try:
                 is_5h = (int(window.get("duration") or 0) == 300
                          and window.get("timeUnit") == "TIME_UNIT_MINUTE")
@@ -145,6 +148,44 @@ def _fetch_kimi_usage(base_url: str, token: str) -> dict:
                     out["five_hour"] = parsed
                 break
     return out
+
+
+KIMI_USAGE_CACHE = Path.home() / ".cache" / "claude-statusbar" / "kimi_usage.json"
+KIMI_USAGE_TTL_S = 60
+
+
+def _kimi_usage(base_url: str, token: str, *, cache_path=None, fetcher=None) -> dict:
+    """Kimi quota with a TTL file cache: at most one HTTP call per
+    KIMI_USAGE_TTL_S across the status line's rapid renders. Fresh cache wins;
+    on any fetch failure the stale cache is served regardless of age; no cache
+    + failure -> {} (limit cells omitted). A missing token never fetches.
+    The token is used only in the request header — never cached or logged."""
+    path = Path(cache_path) if cache_path else KIMI_USAGE_CACHE
+    fetch = fetcher or _fetch_kimi_usage
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(cached, dict):
+            cached = None
+    except (OSError, ValueError):
+        cached = None
+    if (cached is not None
+            and time.time() - cached.get("fetched_at", 0) < KIMI_USAGE_TTL_S):
+        return cached.get("limits") or {}
+    if not token:
+        return (cached or {}).get("limits") or {}
+    try:
+        limits = fetch(base_url, token)
+    except Exception:
+        return (cached or {}).get("limits") or {}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"fetched_at": time.time(), "limits": limits}),
+                       encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return limits
 
 
 def parse_stdin_data() -> Dict[str, Any]:

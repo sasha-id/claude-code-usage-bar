@@ -1,10 +1,11 @@
 """Backend-aware 5h/7d limits: default (Anthropic subscription) vs kimi-k3."""
 import json
+import time
 
 import pytest
 
 from claude_statusbar import core
-from claude_statusbar.core import _backend, _fetch_kimi_usage
+from claude_statusbar.core import _backend, _fetch_kimi_usage, _kimi_usage
 
 
 class TestBackend:
@@ -109,3 +110,74 @@ class TestFetchKimiUsage:
                                           "resetTime": "not-a-date"}}]}
         _mock_urlopen(monkeypatch, payload)
         assert _fetch_kimi_usage("https://api.kimi.com/coding", "tok") == {}
+
+    def test_non_dict_window_entry_is_skipped(self, monkeypatch):
+        payload = {"usage": LIVE_PAYLOAD["usage"],
+                   "limits": [{"window": "oops", "detail": {}}]}
+        _mock_urlopen(monkeypatch, payload)
+        out = _fetch_kimi_usage("https://api.kimi.com/coding", "tok")
+        assert "five_hour" not in out
+        assert out["seven_day"]["pct"] == pytest.approx(12.0)
+
+
+GOOD = {"five_hour": {"pct": 16.0, "resets_at": 1784821868},
+        "seven_day": {"pct": 12.0, "resets_at": 1785336668}}
+
+
+class TestKimiUsageCache:
+    def _write_cache(self, path, age_s, limits=GOOD):
+        path.write_text(json.dumps(
+            {"fetched_at": time.time() - age_s, "limits": limits}))
+
+    def test_fresh_cache_skips_fetch(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        self._write_cache(cache, age_s=10)
+
+        def boom(base, tok):
+            raise AssertionError("fetch must not run inside the TTL")
+
+        assert _kimi_usage("b", "t", cache_path=cache, fetcher=boom) == GOOD
+
+    def test_stale_cache_fetches_and_rewrites(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        self._write_cache(cache, age_s=3600, limits={"stale": True})
+        new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
+        out = _kimi_usage("b", "t", cache_path=cache, fetcher=lambda b, t: new)
+        assert out == new
+        written = json.loads(cache.read_text())
+        assert written["limits"] == new
+        assert written["fetched_at"] > time.time() - 60
+
+    def test_fetch_error_serves_stale_cache(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        self._write_cache(cache, age_s=86400)  # any age — errors keep it
+
+        def fail(base, tok):
+            raise OSError("timeout")
+
+        assert _kimi_usage("b", "t", cache_path=cache, fetcher=fail) == GOOD
+
+    def test_fetch_error_without_cache_returns_empty(self, tmp_path):
+        def fail(base, tok):
+            raise OSError("timeout")
+
+        assert _kimi_usage("b", "t", cache_path=tmp_path / "none.json",
+                           fetcher=fail) == {}
+
+    def test_missing_token_never_fetches(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        self._write_cache(cache, age_s=86400)
+
+        def boom(base, tok):
+            raise AssertionError("fetch must not run without a token")
+
+        assert _kimi_usage("b", "", cache_path=cache, fetcher=boom) == GOOD
+
+    def test_corrupt_cache_is_treated_as_absent(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        cache.write_text("not json{{")
+
+        def fail(base, tok):
+            raise OSError("down")
+
+        assert _kimi_usage("b", "t", cache_path=cache, fetcher=fail) == {}
