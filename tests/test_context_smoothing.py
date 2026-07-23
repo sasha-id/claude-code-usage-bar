@@ -5,7 +5,10 @@ the status line receives a stable ~259K context interrupted by a single-refresh
 dip to ~165K (a subagent/auxiliary request's usage), then recovers. The meter
 must not follow the transient dip.
 """
+import io
+import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -73,8 +76,9 @@ def test_confirmed_drop_is_accepted(tmp_path):
     used, _ = _smooth_context(SID, 40000, 1_000_000, sp)
     assert used == 250000
     # ...but a second, consistent low reading confirms it -> accepted
-    used, _ = _smooth_context(SID, 41000, 1_000_000, sp)
+    used, size = _smooth_context(SID, 41000, 100000, sp)
     assert used == 41000
+    assert size == 100000
 
 
 def test_transient_dip_holds_prior_context_size(tmp_path):
@@ -93,6 +97,56 @@ def test_new_session_resets(tmp_path):
     _smooth_context("old", 300000, 1_000_000, sp)
     used, _ = _smooth_context("new", 5000, 1_000_000, sp)
     assert used == 5000
+
+
+def test_interleaved_sessions_keep_independent_history(tmp_path):
+    sp = _state(tmp_path)
+    _smooth_context("session-a", 300000, 1_000_000, sp)
+    _smooth_context("session-b", 200000, 1_000_000, sp)
+
+    used, _ = _smooth_context("session-a", 5000, 1_000_000, sp)
+
+    assert used == 300000
+
+
+def test_missing_session_id_does_not_reuse_persisted_history(tmp_path):
+    sp = _state(tmp_path)
+    _smooth_context("session-a", 300000, 1_000_000, sp)
+
+    used, size = _smooth_context("", 5000, 100000, sp)
+
+    assert (used, size) == (5000, 100000)
+
+
+def test_parse_context_prefers_official_percentage(tmp_path, monkeypatch):
+    payload = {
+        "session_id": "session-context",
+        "context_window": {
+            "used_percentage": 75,
+            "context_window_size": 200000,
+            "total_input_tokens": 100000,
+            "total_output_tokens": 50000,
+        },
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(core, "CTX_STATE_FILE", tmp_path / "ctx_state.json")
+
+    result = core.parse_stdin_data()
+
+    assert result["context_used_pct"] == 75
+    assert result["total_input_tokens"] == 150000
+
+
+def test_context_state_files_are_owner_only_on_posix(tmp_path):
+    if os.name == "nt":
+        return
+
+    sp = _state(tmp_path)
+    _smooth_context("session-permissions", 100000, 1_000_000, sp)
+
+    assert Path(sp).stat().st_mode & 0o777 == 0o600
+    assert Path(f"{sp}.lock").stat().st_mode & 0o777 == 0o600
+    assert tmp_path.stat().st_mode & 0o777 == 0o700
 
 
 def test_overlapping_update_keeps_last_complete_state(tmp_path):

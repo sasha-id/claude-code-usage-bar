@@ -103,8 +103,10 @@ New module-level pieces in `core.py`:
   error (timeout, non-200, malformed JSON), return the stale cache regardless
   of age; if there is no cache at all, return `{}` (limit cells omitted for that
   render). The lock is held for the complete read/fetch/write section and is
-  released by the OS if the owner exits. A hashed URL/token identity scopes the
-  refresh marker, so one account's failed refresh cannot throttle another.
+  released by the OS if the owner exits. The cache stores a bounded map of
+  hashed URL/token identities, so alternating accounts retain independent
+  entries. The same identity scopes the refresh marker, so one account's
+  failed refresh cannot throttle another.
 - The token is read from `ANTHROPIC_AUTH_TOKEN` in env and used only in the
   request header — never written to the cache file, logs, or output.
 
@@ -137,7 +139,9 @@ same keys and is untouched.
 The statusline hot path pays at most one ~2.5s-bounded HTTP call per 60s; all
 other renders read one small JSON file. Each refresh attempt updates a
 credential-scoped marker, so transport failures and cache-payload write
-failures do not cause a request on every subsequent render.
+failures do not cause a request on every subsequent render. Expired marker
+files are pruned during refresh, and the context-state cache is also bounded
+and owner-readable only.
 
 ### Testing
 
@@ -151,7 +155,9 @@ keep it that way):
 - cache: fresh → no HTTP call; stale → fetch and rewrite; fetch error → stale
   served; no cache + fetch error → `{}`
 - cache identity: same token on different URLs cannot share a cache entry
-- context smoothing: an active owner cannot be reclaimed by a stale-lock check
+- cache identity: alternating URL/token identities retain independent entries
+- context smoothing: an active owner cannot be reclaimed by a stale-lock check;
+  interleaved sessions retain independent history
 - regression: default-backend parse output for a stdin payload with `rate_limits`
   is unchanged (same keys, same values)
 

@@ -34,6 +34,11 @@ class TestBackend:
         monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://kimi.com/coding")
         assert _backend() == "kimi"
 
+    def test_kimi_host_with_trailing_whitespace_is_kimi(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_BASE_URL",
+                           "https://api.kimi.com/coding ")
+        assert _backend() == "kimi"
+
     def test_http_kimi_host_is_not_kimi(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://api.kimi.com/coding")
         assert _backend() == "other"
@@ -219,8 +224,9 @@ class TestKimiUsageCache:
         out = _kimi_usage("b", "t", cache_path=cache, fetcher=lambda b, t: new)
         assert out == new
         written = json.loads(cache.read_text())
-        assert written["limits"] == new
-        assert written["fetched_at"] > time.time() - 60
+        entry = written["entries"][core._kimi_cache_key("b", "t")]
+        assert entry["limits"] == new
+        assert entry["fetched_at"] > time.time() - 60
 
     def test_fetch_error_serves_stale_cache(self, tmp_path):
         cache = tmp_path / "kimi_usage.json"
@@ -291,6 +297,98 @@ class TestKimiUsageCache:
 
         assert fetches == [("old", "same"), ("new", "same")]
 
+    def test_refresh_throttle_is_scoped_to_token(
+            self, monkeypatch, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        fetches = []
+
+        def fetch(base, token):
+            fetches.append((base, token))
+            return {"five_hour": {"pct": 1.0, "resets_at": 2}}
+
+        def fail_replace(src, dst):
+            raise OSError("read-only cache")
+
+        monkeypatch.setattr(core.os, "replace", fail_replace)
+
+        _kimi_usage("same", "old", cache_path=cache, fetcher=fetch)
+        _kimi_usage("same", "new", cache_path=cache, fetcher=fetch)
+
+        assert fetches == [("same", "old"), ("same", "new")]
+
+    def test_cache_keeps_alternating_identities(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        fetches = []
+
+        def fetch(base, token):
+            fetches.append((base, token))
+            return {"five_hour": {"pct": len(fetches), "resets_at": 2}}
+
+        first = _kimi_usage("same", "old", cache_path=cache, fetcher=fetch)
+        second = _kimi_usage("same", "new", cache_path=cache, fetcher=fetch)
+        first_again = _kimi_usage("same", "old", cache_path=cache,
+                                  fetcher=fetch)
+
+        assert first["five_hour"]["pct"] == 1
+        assert second["five_hour"]["pct"] == 2
+        assert first_again == first
+        assert fetches == [("same", "old"), ("same", "new")]
+
+    def test_usage_normalizes_base_url_before_fetching(self, tmp_path):
+        seen = []
+
+        def fetch(base, token):
+            seen.append(base)
+            return GOOD
+
+        _kimi_usage(" https://api.kimi.com/coding/ ", "token",
+                    cache_path=tmp_path / "kimi_usage.json", fetcher=fetch)
+
+        assert seen == ["https://api.kimi.com/coding/"]
+
+    def test_cache_evicts_oldest_identity_when_bounded(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+
+        def fetch(base, token):
+            return {"five_hour": {"pct": int(token), "resets_at": 2}}
+
+        for token in range(core.KIMI_USAGE_MAX_CACHE_ENTRIES + 1):
+            assert _kimi_usage("base", str(token), cache_path=cache,
+                               fetcher=fetch)
+
+        entries = json.loads(cache.read_text())["entries"]
+        assert len(entries) == core.KIMI_USAGE_MAX_CACHE_ENTRIES
+        assert core._kimi_cache_key("base", "0") not in entries
+        assert core._kimi_cache_key(
+            "base", str(core.KIMI_USAGE_MAX_CACHE_ENTRIES)) in entries
+
+    def test_expired_refresh_markers_are_cleaned_during_refresh(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        expired = core._kimi_refresh_marker_path(
+            cache, core._kimi_cache_key("old", "token"))
+        expired.parent.mkdir(parents=True, exist_ok=True)
+        expired.touch()
+        old_time = time.time() - core.KIMI_USAGE_TTL_S - 1
+        os.utime(expired, (old_time, old_time))
+
+        _kimi_usage("current", "token", cache_path=cache,
+                    fetcher=lambda base, token: GOOD)
+
+        assert not expired.exists()
+
+    def test_cache_files_are_owner_only_on_posix(self, tmp_path):
+        if os.name == "nt":
+            return
+
+        cache = tmp_path / "kimi_usage.json"
+        _kimi_usage("b", "t", cache_path=cache,
+                    fetcher=lambda b, t: {"five_hour": {
+                        "pct": 1.0, "resets_at": 2}})
+
+        assert cache.stat().st_mode & 0o777 == 0o600
+        assert cache.with_name("kimi_usage.json.lock").stat().st_mode & 0o777 == 0o600
+        assert cache.parent.stat().st_mode & 0o777 == 0o700
+
     def test_corrupt_cache_is_treated_as_absent(self, tmp_path):
         cache = tmp_path / "kimi_usage.json"
         cache.write_text("not json{{")
@@ -299,6 +397,19 @@ class TestKimiUsageCache:
             raise OSError("down")
 
         assert _kimi_usage("b", "t", cache_path=cache, fetcher=fail) == {}
+
+    def test_non_string_legacy_cache_key_is_treated_as_absent(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        cache.write_text(json.dumps({"cache_key": ["bad"],
+                                     "fetched_at": time.time(),
+                                     "limits": GOOD}))
+        new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
+
+        assert _kimi_usage("b", "t", cache_path=cache,
+                           fetcher=lambda base, token: new) == new
+
+        written = json.loads(cache.read_text())
+        assert core._kimi_cache_key("b", "t") in written["entries"]
 
     def test_non_numeric_fetched_at_treated_as_stale(self, tmp_path):
         cache = tmp_path / "kimi_usage.json"

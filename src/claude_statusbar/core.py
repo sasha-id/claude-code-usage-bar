@@ -2,10 +2,11 @@
 """
 Claude Code Status Bar Monitor.
 
-Rate-limit, context-window, and model data all arrive via the stdin payload
-that Claude Code sends to custom `statusLine` commands. This module parses
-that payload and renders the status line — no subprocesses, no file scans on
-the hot path.
+Context-window and model data arrive via the stdin payload that Claude Code
+sends to custom `statusLine` commands. Default-backend rate limits come from
+that payload too; the Kimi backend reads a small credential-scoped cache and
+refreshes it from Kimi's usage API when needed. This module renders the status
+line without subprocesses.
 """
 
 import hashlib
@@ -29,6 +30,7 @@ logging.basicConfig(level=logging.ERROR)
 
 CTX_STATE_FILE = Path.home() / ".cache" / "claude-statusbar" / "ctx_state.json"
 CTX_STATE_LEASE_S = 1
+CTX_STATE_MAX_SESSIONS = 32
 
 
 def _claim_file_lease(path: Path, lease_s: float):
@@ -43,6 +45,10 @@ def _claim_file_lease(path: Path, lease_s: float):
     lease_path = path.with_name(f"{path.name}.lock")
     try:
         lease_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(lease_path.parent, 0o700)
+        except OSError:
+            pass
     except OSError:
         return None
 
@@ -108,24 +114,43 @@ def _smooth_context(session_id, cur_used, cur_size, state_path=None):
     Returns (used_tokens, size) to display.
     """
     path = Path(state_path) if state_path else CTX_STATE_FILE
+    session_key = str(session_id or "")
+    if not session_key:
+        return cur_used, cur_size
+
+    def get_sessions(raw):
+        if not isinstance(raw, dict):
+            return {}
+        sessions = raw.get("sessions")
+        if isinstance(sessions, dict):
+            return sessions
+        if "session_id" in raw:
+            return {str(raw.get("session_id") or ""): {
+                "shown_used": raw.get("shown_used", 0) or 0,
+                "shown_size": raw.get("shown_size", 0) or 0,
+                "pend_used": raw.get("pend_used"),
+            }}
+        return {}
+
+    def read_state():
+        try:
+            return get_sessions(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return {}
+
     lease = _claim_file_lease(path, CTX_STATE_LEASE_S)
     if lease is None:
-        try:
-            st = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, TypeError):
-            return cur_used, cur_size
-        if st.get("session_id") != session_id:
+        st = read_state().get(session_key)
+        if not isinstance(st, dict):
             return cur_used, cur_size
         return (st.get("shown_used", 0) or 0,
                 st.get("shown_size", 0) or cur_size)
     try:
-        try:
-            st = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, TypeError):
-            st = {}
-        if st.get("session_id") != session_id:
-            st = {"session_id": session_id, "shown_used": 0,
-                  "shown_size": cur_size or 0, "pend_used": None}
+        sessions = read_state()
+        st = sessions.pop(session_key, None)
+        if not isinstance(st, dict):
+            st = {"shown_used": 0, "shown_size": cur_size or 0,
+                  "pend_used": None}
 
         shown_used = st.get("shown_used", 0) or 0
         shown_size = st.get("shown_size", 0) or 0
@@ -140,12 +165,12 @@ def _smooth_context(session_id, cur_used, cur_size, state_path=None):
             pend = st.get("pend_used")
             if pend and abs(cur_used - pend) <= max(2000, int(shown_used * 0.05)):
                 st["shown_used"], st["pend_used"] = cur_used, None
-                out_used = cur_used
+                out_used, out_size = cur_used, (cur_size or shown_size)
             else:
                 st["pend_used"] = cur_used
                 out_used = shown_used
                 hold_previous_size = True
-            out_size = shown_size or cur_size
+                out_size = shown_size or cur_size
         else:
             # growth or small change -> accept immediately
             st["shown_used"], st["pend_used"] = cur_used, None
@@ -153,10 +178,15 @@ def _smooth_context(session_id, cur_used, cur_size, state_path=None):
 
         if cur_size and not hold_previous_size:
             st["shown_size"] = cur_size
+        st["updated_at"] = time.time()
+        sessions[session_key] = st
+        while len(sessions) > CTX_STATE_MAX_SESSIONS:
+            sessions.pop(next(iter(sessions)))
         try:
             tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(st), encoding="utf-8")
+            tmp.write_text(json.dumps({"sessions": sessions}), encoding="utf-8")
             os.replace(tmp, path)
+            os.chmod(path, 0o600)
         except OSError:
             pass
         return out_used, (out_size or cur_size)
@@ -296,6 +326,7 @@ def _fetch_kimi_usage(base_url: str, token: str) -> dict:
 KIMI_USAGE_CACHE = Path.home() / ".cache" / "claude-statusbar" / "kimi_usage.json"
 KIMI_USAGE_TTL_S = 60
 KIMI_USAGE_LEASE_S = 10
+KIMI_USAGE_MAX_CACHE_ENTRIES = 16
 
 
 def _kimi_cache_key(base_url: str, token: str) -> str:
@@ -310,12 +341,59 @@ def _read_kimi_cache(path: Path, cache_key: str) -> Optional[Dict[str, Any]]:
         return None
     if not isinstance(cached, dict):
         return None
-    if cached.get("cache_key") != cache_key:
+    entries = cached.get("entries")
+    if isinstance(entries, dict):
+        cached = entries.get(cache_key)
+    elif cached.get("cache_key") != cache_key:
+        cached = None
+    if not isinstance(cached, dict):
         return None
     limits = _valid_kimi_limits(cached.get("limits"))
     if limits is None:
         return None
     return {"fetched_at": cached.get("fetched_at"), "limits": limits}
+
+
+def _cache_entry_timestamp(entry: Any) -> float:
+    if not isinstance(entry, dict):
+        return 0
+    try:
+        value = float(entry.get("fetched_at"))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return value if math.isfinite(value) else 0
+
+
+def _write_kimi_cache(path: Path, cache_key: str, limits: dict) -> None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = {}
+    entries = raw.get("entries") if isinstance(raw, dict) else None
+    if not isinstance(entries, dict):
+        entries = {}
+        legacy_key = raw.get("cache_key") if isinstance(raw, dict) else None
+        if isinstance(legacy_key, str) and legacy_key:
+            entries[legacy_key] = {
+                "fetched_at": raw.get("fetched_at"),
+                "limits": raw.get("limits"),
+            }
+    entries[cache_key] = {"fetched_at": time.time(), "limits": limits}
+    for key in sorted(entries, key=lambda item: _cache_entry_timestamp(entries[item])):
+        if len(entries) <= KIMI_USAGE_MAX_CACHE_ENTRIES:
+            break
+        if key != cache_key:
+            entries.pop(key, None)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"entries": entries}), encoding="utf-8")
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
 
 
 def _kimi_cache_is_fresh(cached: Optional[Dict[str, Any]]) -> bool:
@@ -351,6 +429,21 @@ def _mark_kimi_refresh(path: Path, cache_key: str) -> None:
         pass
 
 
+def _cleanup_kimi_refresh_markers(path: Path) -> None:
+    try:
+        markers = path.parent.glob(f"{path.name}.*.refresh")
+    except OSError:
+        return
+    now = time.time()
+    for marker in markers:
+        try:
+            age = now - marker.stat().st_mtime
+            if not math.isfinite(age) or age < 0 or age >= KIMI_USAGE_TTL_S:
+                marker.unlink()
+        except OSError:
+            pass
+
+
 def _kimi_usage(base_url: str, token: str, *, cache_path=None, fetcher=None) -> dict:
     """Kimi quota with a TTL file cache and an exclusive refresh lease.
     Fresh cache wins; concurrent stale renders serve the cache while its owner
@@ -358,6 +451,7 @@ def _kimi_usage(base_url: str, token: str, *, cache_path=None, fetcher=None) -> 
     no cache + failure -> {} (limit cells omitted). A missing token never
     fetches. The token is used only in the request header — never cached or
     logged."""
+    base_url = base_url.strip()
     path = Path(cache_path) if cache_path else KIMI_USAGE_CACHE
     cache_key = _kimi_cache_key(base_url, token)
     fetch = fetcher or _fetch_kimi_usage
@@ -377,6 +471,7 @@ def _kimi_usage(base_url: str, token: str, *, cache_path=None, fetcher=None) -> 
         cached = _read_kimi_cache(path, cache_key)
         if _kimi_cache_is_fresh(cached):
             return cached.get("limits") or {}
+        _cleanup_kimi_refresh_markers(path)
         _mark_kimi_refresh(path, cache_key)
         try:
             limits = _valid_kimi_limits(fetch(base_url, token))
@@ -385,18 +480,8 @@ def _kimi_usage(base_url: str, token: str, *, cache_path=None, fetcher=None) -> 
         if limits is None:
             return (cached or {}).get("limits") or {}
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                os.chmod(path.parent, 0o700)
-            except OSError:
-                pass
-            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps({"cache_key": cache_key,
-                                       "fetched_at": time.time(),
-                                       "limits": limits}),
-                           encoding="utf-8")
-            os.replace(tmp, path)
-            os.chmod(path, 0o600)
+            _write_kimi_cache(path, cache_key, limits)
+            _kimi_refresh_marker_path(path, cache_key).unlink()
         except OSError:
             pass
         return limits
@@ -501,11 +586,11 @@ def parse_stdin_data() -> Dict[str, Any]:
         # Debounce context to stop gateway-induced 0<->N flicker (litellm/OpenRouter).
         # No-op for direct Anthropic, whose readings grow monotonically.
         size = result.get('context_window_size', 0)
-        cur_used = result.get('total_input_tokens', 0) or 0
-        if not cur_used:
-            pct = result.get('context_used_pct', 0)
-            if pct and size:
-                cur_used = int(size * pct / 100)
+        pct = result.get('context_used_pct', 0)
+        if pct and size:
+            cur_used = int(size * pct / 100)
+        else:
+            cur_used = result.get('total_input_tokens', 0) or 0
         sm_used, sm_size = _smooth_context(result.get('session_id', ''), cur_used, size)
         if sm_size:
             result['context_window_size'] = sm_size

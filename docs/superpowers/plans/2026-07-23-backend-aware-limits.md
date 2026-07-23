@@ -14,7 +14,7 @@
 
 - **Modify:** `src/claude_statusbar/core.py` — add `_backend()`, `_fetch_kimi_usage()`, `_kimi_usage()`; restructure the rate-limit block of `parse_stdin_data()`.
 - **Create:** `tests/test_kimi_usage.py` — all new tests.
-- **Modify:** `tests/test_context_smoothing.py` — cover active-lock ownership during stale-lock checks.
+- **Modify:** `tests/test_context_smoothing.py` — cover active-lock ownership and per-session state during stale-lock checks.
 
 Existing test conventions (match them): plain pytest functions, imports like `from claude_statusbar.core import _smooth_context`, `tmp_path` for file state, `monkeypatch.setenv` / `monkeypatch.setattr` for isolation (see `tests/test_context_smoothing.py`, `tests/test_cli.py`).
 

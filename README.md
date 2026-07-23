@@ -21,7 +21,7 @@ It shows your current Claude.ai rate-limit usage, reset timers, context window u
 | `↯` | Fast mode is active |
 | `ᓚᘏᗢ Giga:working!` | Optional status-bar pet |
 
-The effort/thinking/fast indicators come from the live `effort.level`, `thinking.enabled`, and `fast_mode` fields in the Claude Code statusLine payload (requires Claude Code `v2.1.119+`); they update mid-session and are hidden for models that don't report an effort level.
+The effort/thinking/fast indicators come from the live `effort.level`, `thinking.enabled`, and `fast_mode` fields in the Claude Code statusLine payload (requires Claude Code `v2.1.119+`); they update mid-session. The effort/thinking portion is hidden for models that don't report an effort level, while fast mode remains independently visible.
 
 Colors default to green / yellow / red at `30%` and `70%`, and can be customized.
 
@@ -89,7 +89,7 @@ cs --json-output
 
 ## Data source
 
-Rate-limit data comes directly from **Anthropic's official API headers** exposed to Claude Code status-line commands through stdin.
+On the default backend, rate-limit data comes from **Anthropic's official API headers** exposed to Claude Code status-line commands through stdin. On the Kimi backend, the 5-hour and 7-day values come from Kimi's authenticated `/v1/usages` API and a credential-scoped cache that refreshes every 60 seconds normally and may serve stale values while the API is unavailable.
 
 Context-window usage comes from the same stdin payload that Claude Code sends to custom `statusLine` commands.
 
