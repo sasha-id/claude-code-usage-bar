@@ -16,6 +16,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 from .progress import format_status_line
 
@@ -79,6 +80,21 @@ def _smooth_context(session_id, cur_used, cur_size, state_path=None):
     except OSError:
         pass
     return out_used, (out_size or cur_size)
+
+
+def _backend() -> str:
+    """Which credential backend this session runs on, from the env Claude Code
+    passes to the status line. The nyx launcher strips ANTHROPIC_BASE_URL on the
+    default (nyx auth) path, so absence means the Anthropic subscription; a
+    *.kimi.com host is the kimi-k3 byo backend; anything else is a byo host we
+    have no usage provider for."""
+    base = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+    if not base:
+        return "default"
+    host = urlparse(base).hostname or ""
+    if host == "kimi.com" or host.endswith(".kimi.com"):
+        return "kimi"
+    return "other"
 
 
 def parse_stdin_data() -> Dict[str, Any]:
