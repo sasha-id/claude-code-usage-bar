@@ -5,6 +5,9 @@ the status line receives a stable ~259K context interrupted by a single-refresh
 dip to ~165K (a subagent/auxiliary request's usage), then recovers. The meter
 must not follow the transient dip.
 """
+from pathlib import Path
+
+from claude_statusbar import core
 from claude_statusbar.core import _smooth_context
 
 
@@ -88,3 +91,17 @@ def test_new_session_resets(tmp_path):
     _smooth_context("old", 300000, 1_000_000, sp)
     used, _ = _smooth_context("new", 5000, 1_000_000, sp)
     assert used == 5000
+
+
+def test_overlapping_update_keeps_last_complete_state(tmp_path):
+    sp = _state(tmp_path)
+    _smooth_context("sess-lock", 200000, 1_000_000, sp)
+    lease = core._claim_file_lease(Path(sp), core.CTX_STATE_LEASE_S)
+
+    try:
+        used, size = _smooth_context("sess-lock", 1000, 100000, sp)
+    finally:
+        core._release_file_lease(lease)
+
+    assert used == 200000
+    assert size == 1_000_000

@@ -8,6 +8,7 @@ that payload and renders the status line — no subprocesses, no file scans on
 the hot path.
 """
 
+import hashlib
 import json
 import math
 import re
@@ -27,6 +28,53 @@ from .progress import format_status_line
 logging.basicConfig(level=logging.ERROR)
 
 CTX_STATE_FILE = Path.home() / ".cache" / "claude-statusbar" / "ctx_state.json"
+CTX_STATE_LEASE_S = 1
+
+
+def _claim_file_lease(path: Path, lease_s: float):
+    lease_path = path.with_name(f"{path.name}.lock")
+    lease = f"{os.getpid()}-{time.time_ns()}"
+    try:
+        lease_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    for _ in range(2):
+        try:
+            fd = os.open(str(lease_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                         0o600)
+        except FileExistsError:
+            try:
+                age = time.time() - lease_path.stat().st_mtime
+                if 0 <= age <= lease_s:
+                    return None
+                lease_path.unlink()
+            except OSError:
+                return None
+            continue
+        except OSError:
+            return None
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
+                lock_file.write(lease)
+        except OSError:
+            try:
+                lease_path.unlink()
+            except OSError:
+                pass
+            return None
+        return lease_path, lease
+    return None
+
+
+def _release_file_lease(lease) -> None:
+    if lease is None:
+        return
+    lease_path, lease_value = lease
+    try:
+        if lease_path.read_text(encoding="utf-8") == lease_value:
+            lease_path.unlink()
+    except OSError:
+        pass
 
 
 def _smooth_context(session_id, cur_used, cur_size, state_path=None):
@@ -46,50 +94,67 @@ def _smooth_context(session_id, cur_used, cur_size, state_path=None):
     Returns (used_tokens, size) to display.
     """
     path = Path(state_path) if state_path else CTX_STATE_FILE
+    lease = _claim_file_lease(path, CTX_STATE_LEASE_S)
+    if lease is None:
+        try:
+            st = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return cur_used, cur_size
+        if st.get("session_id") != session_id:
+            return cur_used, cur_size
+        return (st.get("shown_used", 0) or 0,
+                st.get("shown_size", 0) or cur_size)
     try:
-        st = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError):
-        st = {}
-    if st.get("session_id") != session_id:
-        st = {"session_id": session_id, "shown_used": 0,
-              "shown_size": cur_size or 0, "pend_used": None}
+        try:
+            st = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            st = {}
+        if st.get("session_id") != session_id:
+            st = {"session_id": session_id, "shown_used": 0,
+                  "shown_size": cur_size or 0, "pend_used": None}
 
-    shown_used = st.get("shown_used", 0) or 0
-    shown_size = st.get("shown_size", 0) or 0
-    hold_previous_size = False
+        shown_used = st.get("shown_used", 0) or 0
+        shown_size = st.get("shown_size", 0) or 0
+        hold_previous_size = False
 
-    if not cur_used or cur_used <= 0:
-        # context omitted this refresh -> hold last stable value
-        out_used, out_size = shown_used, (shown_size or cur_size)
-        hold_previous_size = True
-    elif shown_used and cur_used < shown_used * 0.8:
-        # large drop: treat as a transient dip unless a 2nd read confirms it
-        pend = st.get("pend_used")
-        if pend and abs(cur_used - pend) <= max(2000, int(shown_used * 0.05)):
-            st["shown_used"], st["pend_used"] = cur_used, None
-            out_used = cur_used
-        else:
-            st["pend_used"] = cur_used
-            out_used = shown_used
+        if not cur_used or cur_used <= 0:
+            # context omitted this refresh -> hold last stable value
+            out_used, out_size = shown_used, (shown_size or cur_size)
             hold_previous_size = True
-        out_size = shown_size or cur_size
-    else:
-        # growth or small change -> accept immediately
-        st["shown_used"], st["pend_used"] = cur_used, None
-        out_used, out_size = cur_used, (cur_size or shown_size)
+        elif shown_used and cur_used < shown_used * 0.8:
+            # large drop: treat as a transient dip unless a 2nd read confirms it
+            pend = st.get("pend_used")
+            if pend and abs(cur_used - pend) <= max(2000, int(shown_used * 0.05)):
+                st["shown_used"], st["pend_used"] = cur_used, None
+                out_used = cur_used
+            else:
+                st["pend_used"] = cur_used
+                out_used = shown_used
+                hold_previous_size = True
+            out_size = shown_size or cur_size
+        else:
+            # growth or small change -> accept immediately
+            st["shown_used"], st["pend_used"] = cur_used, None
+            out_used, out_size = cur_used, (cur_size or shown_size)
 
-    if cur_size and not hold_previous_size:
-        st["shown_size"] = cur_size
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(st), encoding="utf-8")
-    except OSError:
-        pass
-    return out_used, (out_size or cur_size)
+        if cur_size and not hold_previous_size:
+            st["shown_size"] = cur_size
+        try:
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(st), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+        return out_used, (out_size or cur_size)
+    finally:
+        _release_file_lease(lease)
 
 
 def _is_kimi_url(base_url: str) -> bool:
-    parsed = urlparse(base_url)
+    try:
+        parsed = urlparse(base_url)
+    except ValueError:
+        return False
     host = parsed.hostname or ""
     return (parsed.scheme == "https"
             and (host == "kimi.com" or host.endswith(".kimi.com")))
@@ -155,7 +220,7 @@ def _valid_kimi_limits(limits: Any) -> Optional[Dict[str, Dict[str, Any]]]:
 
 def _parse_kimi_window(detail: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """One Kimi quota window ({limit, used, resetTime}, all strings) ->
-    {"pct": 0-100, "resets_at": epoch} or None when it doesn't parse."""
+    a finite non-negative percentage and reset epoch, or None on failure."""
     try:
         limit = float(detail.get("limit"))
         used = float(detail.get("used"))
@@ -169,6 +234,11 @@ def _parse_kimi_window(detail: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                                "resets_at": resets_at})
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def _fetch_kimi_usage(base_url: str, token: str) -> dict:
     """GET <base_url>/v1/usages and map Kimi's quota onto our two windows:
     weekly (top-level `usage`) -> seven_day, the 300-minute rolling window in
@@ -180,7 +250,8 @@ def _fetch_kimi_usage(base_url: str, token: str) -> dict:
     req = urllib.request.Request(
         base_url.rstrip("/") + "/v1/usages",
         headers={"Authorization": f"Bearer {token}", "User-Agent": "KimiCLI/1.6"})
-    with urllib.request.urlopen(req, timeout=2.5) as resp:
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    with opener.open(req, timeout=2.5) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     out: dict = {}
     if isinstance(payload, dict):
@@ -213,12 +284,19 @@ KIMI_USAGE_TTL_S = 60
 KIMI_USAGE_LEASE_S = 10
 
 
-def _read_kimi_cache(path: Path) -> Optional[Dict[str, Any]]:
+def _kimi_cache_key(base_url: str, token: str) -> str:
+    identity = f"{base_url.rstrip('/')}\0{token}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _read_kimi_cache(path: Path, cache_key: str) -> Optional[Dict[str, Any]]:
     try:
         cached = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if not isinstance(cached, dict):
+        return None
+    if cached.get("cache_key") != cache_key:
         return None
     limits = _valid_kimi_limits(cached.get("limits"))
     if limits is None:
@@ -233,54 +311,8 @@ def _kimi_cache_is_fresh(cached: Optional[Dict[str, Any]]) -> bool:
         fetched_at = float(cached.get("fetched_at"))
     except (TypeError, ValueError, OverflowError):
         return False
-    return (math.isfinite(fetched_at)
-            and time.time() - fetched_at < KIMI_USAGE_TTL_S)
-
-
-def _claim_kimi_usage_lease(path: Path):
-    """Atomically claim the short refresh lease, or None when one is active."""
-    lease_path = path.with_name(f"{path.name}.lock")
-    lease = f"{os.getpid()}-{time.time_ns()}"
-    try:
-        lease_path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return None
-    for _ in range(2):
-        try:
-            fd = os.open(str(lease_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                         0o600)
-        except FileExistsError:
-            try:
-                if time.time() - lease_path.stat().st_mtime <= KIMI_USAGE_LEASE_S:
-                    return None
-                lease_path.unlink()
-            except OSError:
-                return None
-            continue
-        except OSError:
-            return None
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
-                lock_file.write(lease)
-        except OSError:
-            try:
-                lease_path.unlink()
-            except OSError:
-                pass
-            return None
-        return lease_path, lease
-    return None
-
-
-def _release_kimi_usage_lease(lease) -> None:
-    if lease is None:
-        return
-    lease_path, lease_value = lease
-    try:
-        if lease_path.read_text(encoding="utf-8") == lease_value:
-            lease_path.unlink()
-    except OSError:
-        pass
+    age = time.time() - fetched_at
+    return math.isfinite(fetched_at) and 0 <= age < KIMI_USAGE_TTL_S
 
 
 def _kimi_usage(base_url: str, token: str, *, cache_path=None, fetcher=None) -> dict:
@@ -291,19 +323,20 @@ def _kimi_usage(base_url: str, token: str, *, cache_path=None, fetcher=None) -> 
     fetches. The token is used only in the request header — never cached or
     logged."""
     path = Path(cache_path) if cache_path else KIMI_USAGE_CACHE
+    cache_key = _kimi_cache_key(base_url, token)
     fetch = fetcher or _fetch_kimi_usage
-    cached = _read_kimi_cache(path)
+    cached = _read_kimi_cache(path, cache_key)
     if _kimi_cache_is_fresh(cached):
         return cached.get("limits") or {}
     if not token:
         return (cached or {}).get("limits") or {}
 
-    lease = _claim_kimi_usage_lease(path)
+    lease = _claim_file_lease(path, KIMI_USAGE_LEASE_S)
     if lease is None:
-        refreshed = _read_kimi_cache(path)
+        refreshed = _read_kimi_cache(path, cache_key)
         return (refreshed or cached or {}).get("limits") or {}
     try:
-        cached = _read_kimi_cache(path)
+        cached = _read_kimi_cache(path, cache_key)
         if _kimi_cache_is_fresh(cached):
             return cached.get("limits") or {}
         try:
@@ -314,15 +347,22 @@ def _kimi_usage(base_url: str, token: str, *, cache_path=None, fetcher=None) -> 
             return (cached or {}).get("limits") or {}
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(path.parent, 0o700)
+            except OSError:
+                pass
             tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps({"fetched_at": time.time(), "limits": limits}),
+            tmp.write_text(json.dumps({"cache_key": cache_key,
+                                       "fetched_at": time.time(),
+                                       "limits": limits}),
                            encoding="utf-8")
             os.replace(tmp, path)
+            os.chmod(path, 0o600)
         except OSError:
             pass
         return limits
     finally:
-        _release_kimi_usage_lease(lease)
+        _release_file_lease(lease)
 
 
 def parse_stdin_data() -> Dict[str, Any]:
@@ -369,7 +409,7 @@ def parse_stdin_data() -> Dict[str, Any]:
         # backend: default (nyx auth) -> Anthropic subscription, from the stdin
         # payload (cached-stdin fallback when a payload omits them); kimi ->
         # Kimi's coding-plan quota from its usages API. The Anthropic fallback
-        # must NOT run on a byo backend — it would show a subscription the
+        # must NOT run on the Kimi backend — it would show a subscription the
         # session isn't consuming (the stale-numbers-on-kimi bug).
         if backend == "kimi":
             usage = _kimi_usage(os.environ.get("ANTHROPIC_BASE_URL", ""),

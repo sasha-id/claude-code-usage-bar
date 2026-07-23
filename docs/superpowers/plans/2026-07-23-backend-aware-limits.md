@@ -1,6 +1,6 @@
 # Backend-Aware 5h/7d Limits Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Execution record:** Implemented and verified on 2026-07-23. The task checkboxes below preserve the original task breakdown.
 
 **Goal:** Show the active backend's real 5h/7d limits in the status bar — Anthropic subscription numbers on the default backend, Kimi coding-plan quota on kimi-k3 — and stop showing stale Anthropic numbers on kimi sessions.
 

@@ -1,6 +1,7 @@
 """Backend-aware 5h/7d limits: default (Anthropic subscription) vs kimi-k3."""
 import io
 import json
+import os
 import sys
 import time
 from threading import Event, Thread
@@ -49,6 +50,10 @@ class TestBackend:
         monkeypatch.setenv("ANTHROPIC_BASE_URL", "not a url")
         assert _backend() == "other"
 
+    def test_malformed_base_url_is_other(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://[")
+        assert _backend() == "other"
+
 
 # Verified live response shape (2026-07-23), values are strings by design.
 LIVE_PAYLOAD = {
@@ -79,11 +84,13 @@ class _FakeResp:
 def _mock_urlopen(monkeypatch, payload):
     calls = []
 
-    def fake(req, timeout=None):
-        calls.append((req, timeout))
-        return _FakeResp(payload)
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            calls.append((req, timeout))
+            return _FakeResp(payload)
 
-    monkeypatch.setattr(core.urllib.request, "urlopen", fake)
+    monkeypatch.setattr(core.urllib.request, "build_opener",
+                        lambda *handlers: _FakeOpener())
     return calls
 
 
@@ -137,6 +144,12 @@ class TestFetchKimiUsage:
             _fetch_kimi_usage("http://api.kimi.com/coding", "tok")
         assert calls == []
 
+    def test_redirect_handler_rejects_follow_up(self):
+        handler = core._NoRedirectHandler()
+        assert handler.redirect_request(
+            None, None, 302, "Found", {}, "https://example.invalid/collect"
+        ) is None
+
     def test_non_finite_api_values_are_omitted(self, monkeypatch):
         payload = {
             "usage": {"limit": "NaN", "used": "12",
@@ -163,9 +176,10 @@ GOOD = {"five_hour": {"pct": 16.0, "resets_at": 1784821868},
 
 
 class TestKimiUsageCache:
-    def _write_cache(self, path, age_s, limits=GOOD):
+    def _write_cache(self, path, age_s, limits=GOOD, base="b", token="t"):
         path.write_text(json.dumps(
-            {"fetched_at": time.time() - age_s, "limits": limits}))
+            {"cache_key": core._kimi_cache_key(base, token),
+             "fetched_at": time.time() - age_s, "limits": limits}))
 
     def test_fresh_cache_skips_fetch(self, tmp_path):
         cache = tmp_path / "kimi_usage.json"
@@ -204,7 +218,7 @@ class TestKimiUsageCache:
 
     def test_missing_token_never_fetches(self, tmp_path):
         cache = tmp_path / "kimi_usage.json"
-        self._write_cache(cache, age_s=86400)
+        self._write_cache(cache, age_s=86400, token="")
 
         def boom(base, tok):
             raise AssertionError("fetch must not run without a token")
@@ -222,26 +236,58 @@ class TestKimiUsageCache:
 
     def test_non_numeric_fetched_at_treated_as_stale(self, tmp_path):
         cache = tmp_path / "kimi_usage.json"
-        cache.write_text(json.dumps({"fetched_at": "junk", "limits": GOOD}))
+        cache.write_text(json.dumps({
+            "cache_key": core._kimi_cache_key("b", "t"),
+            "fetched_at": "junk", "limits": GOOD}))
         new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
         out = _kimi_usage("b", "t", cache_path=cache, fetcher=lambda b, t: new)
         assert out == new
 
     def test_impossible_fetched_at_is_treated_as_stale(self, tmp_path):
         cache = tmp_path / "kimi_usage.json"
-        cache.write_text(json.dumps({"fetched_at": 10 ** 1000, "limits": GOOD}))
+        cache.write_text(json.dumps({
+            "cache_key": core._kimi_cache_key("b", "t"),
+            "fetched_at": 10 ** 1000, "limits": GOOD}))
         new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
         out = _kimi_usage("b", "t", cache_path=cache, fetcher=lambda b, t: new)
         assert out == new
 
     def test_non_dict_limits_treated_as_absent(self, tmp_path):
         cache = tmp_path / "kimi_usage.json"
-        cache.write_text(json.dumps({"fetched_at": time.time(), "limits": [1, 2]}))
+        cache.write_text(json.dumps({
+            "cache_key": core._kimi_cache_key("b", "t"),
+            "fetched_at": time.time(), "limits": [1, 2]}))
 
         def fail(base, tok):
             raise OSError("down")
 
         assert _kimi_usage("b", "t", cache_path=cache, fetcher=fail) == {}
+
+    def test_future_fetched_at_is_treated_as_stale(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        self._write_cache(cache, age_s=-3600)
+        new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
+        assert _kimi_usage("b", "t", cache_path=cache,
+                           fetcher=lambda b, t: new) == new
+
+    def test_future_refresh_lease_is_reclaimable(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        lock = cache.with_name(f"{cache.name}.lock")
+        lock.write_text("old-lease")
+        future = time.time() + 3600
+        os.utime(lock, (future, future))
+
+        lease = core._claim_file_lease(cache, 10)
+
+        assert lease is not None
+        core._release_file_lease(lease)
+
+    def test_cache_is_scoped_to_token(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        self._write_cache(cache, age_s=10, token="old")
+        new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
+        assert _kimi_usage("b", "new", cache_path=cache,
+                           fetcher=lambda b, t: new) == new
 
     def test_incomplete_fresh_cache_omits_only_invalid_window(self, tmp_path):
         cache = tmp_path / "kimi_usage.json"
@@ -259,7 +305,7 @@ class TestKimiUsageCache:
 
     def test_impossible_reset_epoch_is_omitted_from_fresh_cache(self, tmp_path):
         cache = tmp_path / "kimi_usage.json"
-        self._write_cache(cache, age_s=10, limits={
+        self._write_cache(cache, age_s=10, token="", limits={
             "five_hour": {"pct": 16.0, "resets_at": 10 ** 1000},
             "seven_day": GOOD["seven_day"],
         })
