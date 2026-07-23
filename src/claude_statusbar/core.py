@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
+import urllib.request
 
 from .progress import format_status_line
 
@@ -95,6 +96,55 @@ def _backend() -> str:
     if host == "kimi.com" or host.endswith(".kimi.com"):
         return "kimi"
     return "other"
+
+
+def _parse_kimi_window(detail: dict) -> dict | None:
+    """One Kimi quota window ({limit, used, resetTime}, all strings) ->
+    {"pct": 0-100, "resets_at": epoch} or None when it doesn't parse."""
+    try:
+        limit = float(detail.get("limit"))
+        used = float(detail.get("used"))
+        resets_at = int(datetime.fromisoformat(
+            detail["resetTime"].replace("Z", "+00:00")).timestamp())
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return None
+    if limit <= 0:
+        return None
+    return {"pct": used / limit * 100.0, "resets_at": resets_at}
+
+
+def _fetch_kimi_usage(base_url: str, token: str) -> dict:
+    """GET <base_url>/v1/usages and map Kimi's quota onto our two windows:
+    weekly (top-level `usage`) -> seven_day, the 300-minute rolling window in
+    `limits[]` -> five_hour. Windows that don't parse are omitted, not fatal.
+    Raises on transport/HTTP/JSON errors — the caller (_kimi_usage) degrades."""
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/v1/usages",
+        headers={"Authorization": f"Bearer {token}", "User-Agent": "KimiCLI/1.6"})
+    with urllib.request.urlopen(req, timeout=2.5) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    out: dict = {}
+    if isinstance(payload, dict):
+        weekly = payload.get("usage")
+        if isinstance(weekly, dict):
+            parsed = _parse_kimi_window(weekly)
+            if parsed:
+                out["seven_day"] = parsed
+        for item in payload.get("limits") or []:
+            if not isinstance(item, dict):
+                continue
+            window = item.get("window") or {}
+            try:
+                is_5h = (int(window.get("duration") or 0) == 300
+                         and window.get("timeUnit") == "TIME_UNIT_MINUTE")
+            except (TypeError, ValueError):
+                continue
+            if is_5h:
+                parsed = _parse_kimi_window(item.get("detail") or {})
+                if parsed:
+                    out["five_hour"] = parsed
+                break
+    return out
 
 
 def parse_stdin_data() -> Dict[str, Any]:
