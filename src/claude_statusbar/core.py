@@ -168,8 +168,14 @@ def _kimi_usage(base_url: str, token: str, *, cache_path=None, fetcher=None) -> 
             cached = None
     except (OSError, ValueError):
         cached = None
-    if (cached is not None
-            and time.time() - cached.get("fetched_at", 0) < KIMI_USAGE_TTL_S):
+    if cached is not None and not isinstance(cached.get("limits"), dict):
+        cached = None
+    try:
+        fresh = (cached is not None
+                 and time.time() - float(cached.get("fetched_at", 0)) < KIMI_USAGE_TTL_S)
+    except (TypeError, ValueError):
+        fresh = False
+    if fresh:
         return cached.get("limits") or {}
     if not token:
         return (cached or {}).get("limits") or {}
@@ -226,32 +232,50 @@ def parse_stdin_data() -> Dict[str, Any]:
             result['model_id'] = model_obj.get('id', '')
             result['display_name'] = model_obj.get('display_name', '')
 
-        # Rate limits (Claude.ai Pro/Max only)
-        rl = data.get('rate_limits', {})
-        fh = rl.get('five_hour', {})
-        if fh:
-            result['rate_limit_pct'] = fh.get('used_percentage', 0)
-            result['rate_limit_resets_at'] = fh.get('resets_at')
-        sd = rl.get('seven_day', {})
-        if sd:
-            result['rate_limit_7d_pct'] = sd.get('used_percentage', 0)
-            result['rate_limit_7d_resets_at'] = sd.get('resets_at')
+        # Rate limits. Which provider's numbers to show depends on the session
+        # backend: default (nyx auth) -> Anthropic subscription, from the stdin
+        # payload (cached-stdin fallback when a payload omits them); kimi ->
+        # Kimi's coding-plan quota from its usages API. The Anthropic fallback
+        # must NOT run on a byo backend — it would show a subscription the
+        # session isn't consuming (the stale-numbers-on-kimi bug).
+        if _backend() == "kimi":
+            usage = _kimi_usage(os.environ.get("ANTHROPIC_BASE_URL", ""),
+                                os.environ.get("ANTHROPIC_AUTH_TOKEN", ""))
+            five = usage.get("five_hour")
+            if five:
+                result['rate_limit_pct'] = five['pct']
+                result['rate_limit_resets_at'] = five['resets_at']
+            seven = usage.get("seven_day")
+            if seven:
+                result['rate_limit_7d_pct'] = seven['pct']
+                result['rate_limit_7d_resets_at'] = seven['resets_at']
+        else:
+            # Anthropic subscription limits (Claude.ai Pro/Max only)
+            rl = data.get('rate_limits', {})
+            fh = rl.get('five_hour', {})
+            if fh:
+                result['rate_limit_pct'] = fh.get('used_percentage', 0)
+                result['rate_limit_resets_at'] = fh.get('resets_at')
+            sd = rl.get('seven_day', {})
+            if sd:
+                result['rate_limit_7d_pct'] = sd.get('used_percentage', 0)
+                result['rate_limit_7d_resets_at'] = sd.get('resets_at')
 
-        # Fallback: load rate_limits from previous session's cached stdin
-        if not fh and not sd:
-            try:
-                cached = json.loads(debug_file.read_text(encoding="utf-8"))
-                cached_rl = cached.get('rate_limits', {})
-                cached_fh = cached_rl.get('five_hour', {})
-                cached_sd = cached_rl.get('seven_day', {})
-                if cached_fh:
-                    result['rate_limit_pct'] = cached_fh.get('used_percentage', 0)
-                    result['rate_limit_resets_at'] = cached_fh.get('resets_at')
-                if cached_sd:
-                    result['rate_limit_7d_pct'] = cached_sd.get('used_percentage', 0)
-                    result['rate_limit_7d_resets_at'] = cached_sd.get('resets_at')
-            except (OSError, json.JSONDecodeError, TypeError):
-                pass
+            # Fallback: load rate_limits from previous session's cached stdin
+            if not fh and not sd:
+                try:
+                    cached = json.loads(debug_file.read_text(encoding="utf-8"))
+                    cached_rl = cached.get('rate_limits', {})
+                    cached_fh = cached_rl.get('five_hour', {})
+                    cached_sd = cached_rl.get('seven_day', {})
+                    if cached_fh:
+                        result['rate_limit_pct'] = cached_fh.get('used_percentage', 0)
+                        result['rate_limit_resets_at'] = cached_fh.get('resets_at')
+                    if cached_sd:
+                        result['rate_limit_7d_pct'] = cached_sd.get('used_percentage', 0)
+                        result['rate_limit_7d_resets_at'] = cached_sd.get('resets_at')
+                except (OSError, json.JSONDecodeError, TypeError):
+                    pass
 
         # Context window
         cw = data.get('context_window', {})

@@ -1,11 +1,18 @@
 """Backend-aware 5h/7d limits: default (Anthropic subscription) vs kimi-k3."""
+import io
 import json
+import sys
 import time
 
 import pytest
 
 from claude_statusbar import core
-from claude_statusbar.core import _backend, _fetch_kimi_usage, _kimi_usage
+from claude_statusbar.core import (
+    _backend,
+    _fetch_kimi_usage,
+    _kimi_usage,
+    parse_stdin_data,
+)
 
 
 class TestBackend:
@@ -181,3 +188,77 @@ class TestKimiUsageCache:
             raise OSError("down")
 
         assert _kimi_usage("b", "t", cache_path=cache, fetcher=fail) == {}
+
+    def test_non_numeric_fetched_at_treated_as_stale(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        cache.write_text(json.dumps({"fetched_at": "junk", "limits": GOOD}))
+        new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
+        out = _kimi_usage("b", "t", cache_path=cache, fetcher=lambda b, t: new)
+        assert out == new
+
+    def test_non_dict_limits_treated_as_absent(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        cache.write_text(json.dumps({"fetched_at": time.time(), "limits": [1, 2]}))
+
+        def fail(base, tok):
+            raise OSError("down")
+
+        assert _kimi_usage("b", "t", cache_path=cache, fetcher=fail) == {}
+
+
+def _run_parse(monkeypatch, tmp_path, payload, env):
+    """parse_stdin_data against a synthetic stdin payload + env. HOME redirects
+    the in-function last_stdin.json cache into tmp_path; CTX_STATE_FILE (a
+    module-level constant) is patched explicitly so _smooth_context can't
+    clobber the real session's state file."""
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(core, "CTX_STATE_FILE", tmp_path / "ctx_state.json")
+    for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
+    for key, val in env.items():
+        monkeypatch.setenv(key, val)
+    return parse_stdin_data()
+
+
+STDIN_RL = {"rate_limits": {
+    "five_hour": {"used_percentage": 42.0, "resets_at": 1784821868},
+    "seven_day": {"used_percentage": 7.0, "resets_at": 1785336668}}}
+
+
+class TestParseStdinData:
+    def test_default_backend_reads_stdin_rate_limits(self, monkeypatch, tmp_path):
+        out = _run_parse(monkeypatch, tmp_path, STDIN_RL, env={})
+        assert out["rate_limit_pct"] == 42.0
+        assert out["rate_limit_7d_pct"] == 7.0
+
+    def test_kimi_backend_uses_kimi_usage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(core, "_kimi_usage", lambda b, t: GOOD)
+        out = _run_parse(monkeypatch, tmp_path, {"model": {}}, env={
+            "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
+            "ANTHROPIC_AUTH_TOKEN": "tok"})
+        assert out["rate_limit_pct"] == 16.0
+        assert out["rate_limit_resets_at"] == 1784821868
+        assert out["rate_limit_7d_pct"] == 12.0
+        assert out["rate_limit_7d_resets_at"] == 1785336668
+
+    def test_kimi_backend_skips_stale_anthropic_fallback(self, monkeypatch, tmp_path):
+        # A previous default-backend session left Anthropic numbers in the cache…
+        cache = tmp_path / ".cache" / "claude-statusbar"
+        cache.mkdir(parents=True)
+        (cache / "last_stdin.json").write_text(json.dumps(STDIN_RL))
+        # …and Kimi has no quota data yet: the bar must show NOTHING, not the
+        # stale Anthropic numbers (today's bug).
+        monkeypatch.setattr(core, "_kimi_usage", lambda b, t: {})
+        out = _run_parse(monkeypatch, tmp_path, {"model": {}}, env={
+            "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
+            "ANTHROPIC_AUTH_TOKEN": "tok"})
+        assert "rate_limit_pct" not in out
+        assert "rate_limit_7d_pct" not in out
+
+    def test_default_backend_keeps_cache_fallback(self, monkeypatch, tmp_path):
+        cache = tmp_path / ".cache" / "claude-statusbar"
+        cache.mkdir(parents=True)
+        (cache / "last_stdin.json").write_text(json.dumps(STDIN_RL))
+        out = _run_parse(monkeypatch, tmp_path, {"model": {}}, env={})
+        assert out["rate_limit_pct"] == 42.0
