@@ -4,7 +4,7 @@
 
 **Goal:** Show the active backend's real 5h/7d limits in the status bar — Anthropic subscription numbers on the default backend, Kimi coding-plan quota on kimi-k3 — and stop showing stale Anthropic numbers on kimi sessions.
 
-**Architecture:** All changes in `src/claude_statusbar/core.py` (plus one new test file). A `_backend()` helper classifies the session from `ANTHROPIC_BASE_URL`; on the kimi backend a throttled, file-cached GET to `<base>/v1/usages` maps Kimi's 5-hour and weekly windows into the existing `rate_limit_*` result keys, so `progress.py` and everything downstream are untouched. Spec: `docs/superpowers/specs/2026-07-23-backend-aware-limits-design.md`.
+**Architecture:** Runtime changes are in `src/claude_statusbar/core.py`, with focused coverage in the Kimi usage and context-smoothing tests. A `_backend()` helper classifies the session from `ANTHROPIC_BASE_URL`; on the kimi backend a throttled, file-cached GET to `<base>/v1/usages` maps Kimi's 5-hour and weekly windows into the existing `rate_limit_*` result keys, so `progress.py` and everything downstream are untouched. Spec: `docs/superpowers/specs/2026-07-23-backend-aware-limits-design.md`.
 
 **Tech Stack:** Python ≥3.9, stdlib only (`urllib.request`, `json`, `time`, `pathlib`), pytest.
 
@@ -14,6 +14,7 @@
 
 - **Modify:** `src/claude_statusbar/core.py` — add `_backend()`, `_fetch_kimi_usage()`, `_kimi_usage()`; restructure the rate-limit block of `parse_stdin_data()`.
 - **Create:** `tests/test_kimi_usage.py` — all new tests.
+- **Modify:** `tests/test_context_smoothing.py` — cover active-lock ownership during stale-lock checks.
 
 Existing test conventions (match them): plain pytest functions, imports like `from claude_statusbar.core import _smooth_context`, `tmp_path` for file state, `monkeypatch.setenv` / `monkeypatch.setattr` for isolation (see `tests/test_context_smoothing.py`, `tests/test_cli.py`).
 

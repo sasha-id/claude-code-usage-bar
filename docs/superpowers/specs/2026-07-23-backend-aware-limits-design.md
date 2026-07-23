@@ -50,7 +50,8 @@ any new status-bar cells.
 
 ## Design
 
-All changes are in `src/claude_statusbar/core.py` plus a new test file.
+All runtime changes are in `src/claude_statusbar/core.py`, with focused
+coverage in the Kimi usage and context-smoothing tests.
 `progress.py` is unchanged — the kimi numbers are mapped into the existing
 `rate_limit_*` result keys, so they render in the same slots (used% form, same as
 Anthropic's percentages).
@@ -63,13 +64,14 @@ session, whose statusLine child inherits its environment):
 - `ANTHROPIC_BASE_URL` unset/empty → **default**. (The nyx launcher strips
   `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` on the
   non-byo path, so absence is the default-backend signal.)
-- `ANTHROPIC_BASE_URL` host ends with `kimi.com` → **kimi**.
-- Any other byo host (e.g. litellm) → current behavior retained (cached-stdin
-  fallback). Known wrong-numbers limitation there; out of scope.
+- A valid `https://kimi.com` or `https://*.kimi.com` URL → **kimi**.
+- Malformed, non-HTTPS, lookalike, and all other non-empty URLs → **other**;
+  current behavior is retained (cached-stdin fallback). Known wrong-numbers
+  limitation there; out of scope.
 
 Detection is a small helper (`_backend()`) returning `"default" | "kimi" | "other"`,
-parsed with `urllib.parse.urlparse` — no string matching on the raw URL beyond the
-host suffix check. An unparseable `ANTHROPIC_BASE_URL` (no host) → `"other"`.
+parsed with `urllib.parse.urlparse`; malformed URLs and lookalike hosts are
+rejected. An unparseable `ANTHROPIC_BASE_URL` (no host) → `"other"`.
 
 ### Kimi usage fetch
 
@@ -81,6 +83,8 @@ New module-level pieces in `core.py`:
   right-stripped of `/`; with nyx's `https://api.kimi.com/coding` this yields the
   verified `https://api.kimi.com/coding/v1/usages`), stdlib `urllib.request`,
   ~2.5s timeout, `Authorization: Bearer <token>`, `User-Agent: KimiCLI/1.6`.
+  Redirects are not followed, so the bearer token cannot be forwarded to a
+  different host.
   Returns
   `{"five_hour": {"pct": float, "resets_at": int}, "seven_day": {...}}` with
   `resets_at` as epoch seconds (parsed from the ISO `resetTime`, matching the
@@ -93,10 +97,13 @@ New module-level pieces in `core.py`:
   - Values are strings in the payload — parse defensively; a window that doesn't
     parse is omitted, not fatal.
 - `_kimi_usage(base_url, token)` — cache wrapper. Fresh cache (< TTL) → return it.
-  Stale/absent → fetch; on success write the cache (atomic temp-file + replace,
-  best-effort) and return. On any fetch error (timeout, non-200, malformed JSON):
-  return the stale cache regardless of age; if there is no cache at all, return
-  `{}` (limit cells omitted for that render).
+  Stale/absent → acquire an advisory refresh lock, then fetch; on success write
+  the cache (atomic temp-file + replace, best-effort) and return. Concurrent
+  renders serve the last cache while the lock owner refreshes. On any fetch
+  error (timeout, non-200, malformed JSON), return the stale cache regardless
+  of age; if there is no cache at all, return `{}` (limit cells omitted for that
+  render). The lock is held for the complete read/fetch/write section and is
+  released by the OS if the owner exits.
 - The token is read from `ANTHROPIC_AUTH_TOKEN` in env and used only in the
   request header — never written to the cache file, logs, or output.
 
@@ -140,6 +147,8 @@ keep it that way):
 - backend detection matrix: unset, `https://api.kimi.com/coding`, unrelated host
 - cache: fresh → no HTTP call; stale → fetch and rewrite; fetch error → stale
   served; no cache + fetch error → `{}`
+- cache identity: same token on different URLs cannot share a cache entry
+- context smoothing: an active owner cannot be reclaimed by a stale-lock check
 - regression: default-backend parse output for a stdin payload with `rate_limits`
   is unchanged (same keys, same values)
 

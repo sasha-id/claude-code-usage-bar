@@ -32,49 +32,63 @@ CTX_STATE_LEASE_S = 1
 
 
 def _claim_file_lease(path: Path, lease_s: float):
+    """Try to hold an advisory lock for the whole critical section.
+
+    ``lease_s`` remains in the private signature for callers that pass the
+    old expiry setting. Advisory locks are released by the OS when a process
+    exits, so a delayed owner cannot be reclaimed while it can still commit a
+    stale state file.
+    """
+    del lease_s
     lease_path = path.with_name(f"{path.name}.lock")
-    lease = f"{os.getpid()}-{time.time_ns()}"
     try:
         lease_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
         return None
-    for _ in range(2):
+
+    try:
+        fd = os.open(str(lease_path), os.O_RDWR | os.O_CREAT, 0o600)
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (ImportError, OSError):
         try:
-            fd = os.open(str(lease_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                         0o600)
-        except FileExistsError:
-            try:
-                age = time.time() - lease_path.stat().st_mtime
-                if 0 <= age <= lease_s:
-                    return None
-                lease_path.unlink()
-            except OSError:
-                return None
-            continue
-        except OSError:
-            return None
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
-                lock_file.write(lease)
-        except OSError:
-            try:
-                lease_path.unlink()
-            except OSError:
-                pass
-            return None
-        return lease_path, lease
-    return None
+            os.close(fd)
+        except (NameError, OSError):
+            pass
+        return None
+    return fd, lease_path
 
 
 def _release_file_lease(lease) -> None:
     if lease is None:
         return
-    lease_path, lease_value = lease
+    fd, _ = lease
     try:
-        if lease_path.read_text(encoding="utf-8") == lease_value:
-            lease_path.unlink()
-    except OSError:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except (ImportError, OSError):
         pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def _smooth_context(session_id, cur_used, cur_size, state_path=None):
@@ -226,7 +240,7 @@ def _parse_kimi_window(detail: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         used = float(detail.get("used"))
         resets_at = int(datetime.fromisoformat(
             detail["resetTime"].replace("Z", "+00:00")).timestamp())
-    except (TypeError, ValueError, KeyError, AttributeError):
+    except (TypeError, ValueError, KeyError, AttributeError, OverflowError):
         return None
     if not math.isfinite(limit) or not math.isfinite(used) or limit <= 0:
         return None

@@ -5,6 +5,8 @@ the status line receives a stable ~259K context interrupted by a single-refresh
 dip to ~165K (a subagent/auxiliary request's usage), then recovers. The meter
 must not follow the transient dip.
 """
+import os
+import time
 from pathlib import Path
 
 from claude_statusbar import core
@@ -105,3 +107,17 @@ def test_overlapping_update_keeps_last_complete_state(tmp_path):
 
     assert used == 200000
     assert size == 1_000_000
+
+
+def test_live_owner_cannot_be_reclaimed_as_stale(tmp_path):
+    sp = _state(tmp_path)
+    lease = core._claim_file_lease(Path(sp), core.CTX_STATE_LEASE_S)
+    assert lease is not None
+
+    try:
+        lock_path = Path(f"{sp}.lock")
+        old = time.time() - (core.CTX_STATE_LEASE_S + 10)
+        os.utime(lock_path, (old, old))
+        assert core._claim_file_lease(Path(sp), core.CTX_STATE_LEASE_S) is None
+    finally:
+        core._release_file_lease(lease)

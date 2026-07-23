@@ -150,6 +150,28 @@ class TestFetchKimiUsage:
             None, None, 302, "Found", {}, "https://example.invalid/collect"
         ) is None
 
+    def test_fetch_installs_no_redirect_handler(self, monkeypatch):
+        handlers = []
+
+        class _Opener:
+            def open(self, req, timeout=None):
+                return _FakeResp(LIVE_PAYLOAD)
+
+        def build_opener(*installed):
+            handlers.extend(installed)
+            return _Opener()
+
+        monkeypatch.setattr(core.urllib.request, "build_opener", build_opener)
+        monkeypatch.setattr(
+            core.urllib.request, "urlopen",
+            lambda *args, **kwargs: pytest.fail("urlopen must not be used"),
+        )
+
+        _fetch_kimi_usage("https://api.kimi.com/coding", "tok")
+
+        assert len(handlers) == 1
+        assert isinstance(handlers[0], core._NoRedirectHandler)
+
     def test_non_finite_api_values_are_omitted(self, monkeypatch):
         payload = {
             "usage": {"limit": "NaN", "used": "12",
@@ -287,6 +309,13 @@ class TestKimiUsageCache:
         self._write_cache(cache, age_s=10, token="old")
         new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
         assert _kimi_usage("b", "new", cache_path=cache,
+                           fetcher=lambda b, t: new) == new
+
+    def test_cache_is_scoped_to_url_with_same_token(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        self._write_cache(cache, age_s=10, base="old", token="same")
+        new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
+        assert _kimi_usage("new", "same", cache_path=cache,
                            fetcher=lambda b, t: new) == new
 
     def test_incomplete_fresh_cache_omits_only_invalid_window(self, tmp_path):
