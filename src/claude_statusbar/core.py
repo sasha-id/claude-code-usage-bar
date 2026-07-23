@@ -329,8 +329,12 @@ def _kimi_cache_is_fresh(cached: Optional[Dict[str, Any]]) -> bool:
     return math.isfinite(fetched_at) and 0 <= age < KIMI_USAGE_TTL_S
 
 
-def _kimi_refresh_marker_is_fresh(path: Path) -> bool:
-    marker = path.with_name(f"{path.name}.refresh")
+def _kimi_refresh_marker_path(path: Path, cache_key: str) -> Path:
+    return path.with_name(f"{path.name}.{cache_key}.refresh")
+
+
+def _kimi_refresh_marker_is_fresh(path: Path, cache_key: str) -> bool:
+    marker = _kimi_refresh_marker_path(path, cache_key)
     try:
         age = time.time() - marker.stat().st_mtime
     except OSError:
@@ -338,8 +342,8 @@ def _kimi_refresh_marker_is_fresh(path: Path) -> bool:
     return math.isfinite(age) and 0 <= age < KIMI_USAGE_TTL_S
 
 
-def _mark_kimi_refresh(path: Path) -> None:
-    marker = path.with_name(f"{path.name}.refresh")
+def _mark_kimi_refresh(path: Path, cache_key: str) -> None:
+    marker = _kimi_refresh_marker_path(path, cache_key)
     try:
         marker.touch(mode=0o600, exist_ok=True)
         os.utime(marker, None)
@@ -362,7 +366,7 @@ def _kimi_usage(base_url: str, token: str, *, cache_path=None, fetcher=None) -> 
         return cached.get("limits") or {}
     if not token:
         return {}
-    if _kimi_refresh_marker_is_fresh(path):
+    if _kimi_refresh_marker_is_fresh(path, cache_key):
         return (cached or {}).get("limits") or {}
 
     lease = _claim_file_lease(path, KIMI_USAGE_LEASE_S)
@@ -373,6 +377,7 @@ def _kimi_usage(base_url: str, token: str, *, cache_path=None, fetcher=None) -> 
         cached = _read_kimi_cache(path, cache_key)
         if _kimi_cache_is_fresh(cached):
             return cached.get("limits") or {}
+        _mark_kimi_refresh(path, cache_key)
         try:
             limits = _valid_kimi_limits(fetch(base_url, token))
         except Exception:
@@ -394,7 +399,6 @@ def _kimi_usage(base_url: str, token: str, *, cache_path=None, fetcher=None) -> 
             os.chmod(path, 0o600)
         except OSError:
             pass
-        _mark_kimi_refresh(path)
         return limits
     finally:
         _release_file_lease(lease)

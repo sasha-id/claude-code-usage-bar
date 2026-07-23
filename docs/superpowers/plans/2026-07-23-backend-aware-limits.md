@@ -223,7 +223,7 @@ import urllib.request
 Add right after `_backend()`:
 
 ```python
-def _parse_kimi_window(detail: dict) -> dict | None:
+def _parse_kimi_window(detail: dict) -> Optional[dict]:
     """One Kimi quota window ({limit, used, resetTime}, all strings) ->
     {"pct": 0-100, "resets_at": epoch} or None when it doesn't parse."""
     try:

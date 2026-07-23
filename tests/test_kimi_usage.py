@@ -231,12 +231,17 @@ class TestKimiUsageCache:
 
         assert _kimi_usage("b", "t", cache_path=cache, fetcher=fail) == GOOD
 
-    def test_fetch_error_without_cache_returns_empty(self, tmp_path):
+    def test_fetch_error_without_cache_returns_empty_and_throttles(self, tmp_path):
+        fetches = []
+
         def fail(base, tok):
+            fetches.append(True)
             raise OSError("timeout")
 
-        assert _kimi_usage("b", "t", cache_path=tmp_path / "none.json",
-                           fetcher=fail) == {}
+        cache = tmp_path / "none.json"
+        assert _kimi_usage("b", "t", cache_path=cache, fetcher=fail) == {}
+        assert _kimi_usage("b", "t", cache_path=cache, fetcher=fail) == {}
+        assert fetches == [True]
 
     def test_missing_token_never_fetches(self, tmp_path):
         cache = tmp_path / "kimi_usage.json"
@@ -266,6 +271,25 @@ class TestKimiUsageCache:
         assert _kimi_usage("b", "t", cache_path=cache,
                            fetcher=fetch) == {}
         assert fetches == [True]
+
+    def test_refresh_throttle_is_scoped_to_url_and_token(
+            self, monkeypatch, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        fetches = []
+
+        def fetch(base, token):
+            fetches.append((base, token))
+            return {"five_hour": {"pct": 1.0, "resets_at": 2}}
+
+        def fail_replace(src, dst):
+            raise OSError("read-only cache")
+
+        monkeypatch.setattr(core.os, "replace", fail_replace)
+
+        _kimi_usage("old", "same", cache_path=cache, fetcher=fetch)
+        _kimi_usage("new", "same", cache_path=cache, fetcher=fetch)
+
+        assert fetches == [("old", "same"), ("new", "same")]
 
     def test_corrupt_cache_is_treated_as_absent(self, tmp_path):
         cache = tmp_path / "kimi_usage.json"

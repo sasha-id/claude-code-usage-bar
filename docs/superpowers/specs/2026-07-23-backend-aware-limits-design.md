@@ -103,7 +103,8 @@ New module-level pieces in `core.py`:
   error (timeout, non-200, malformed JSON), return the stale cache regardless
   of age; if there is no cache at all, return `{}` (limit cells omitted for that
   render). The lock is held for the complete read/fetch/write section and is
-  released by the OS if the owner exits.
+  released by the OS if the owner exits. A hashed URL/token identity scopes the
+  refresh marker, so one account's failed refresh cannot throttle another.
 - The token is read from `ANTHROPIC_AUTH_TOKEN` in env and used only in the
   request header — never written to the cache file, logs, or output.
 
@@ -134,9 +135,9 @@ same keys and is untouched.
 | Cache file unreadable/corrupt | treat as absent |
 
 The statusline hot path pays at most one ~2.5s-bounded HTTP call per 60s; all
-other renders read one small JSON file. A successful fetch also updates a
-separate refresh marker, so a cache-payload write failure does not cause a
-request on every subsequent render.
+other renders read one small JSON file. Each refresh attempt updates a
+credential-scoped marker, so transport failures and cache-payload write
+failures do not cause a request on every subsequent render.
 
 ### Testing
 
