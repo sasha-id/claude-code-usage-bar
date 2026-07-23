@@ -22,6 +22,64 @@ from .progress import format_status_line
 # Suppress log output
 logging.basicConfig(level=logging.ERROR)
 
+CTX_STATE_FILE = Path.home() / ".cache" / "claude-statusbar" / "ctx_state.json"
+
+
+def _smooth_context(session_id, cur_used, cur_size, state_path=None):
+    """Debounce the context-window reading to stop the 0<->N status-bar flicker.
+
+    When Claude Code is routed through a gateway (litellm/OpenRouter) it hands
+    the status line transient context readings on sub-second refreshes: a single
+    refresh may report a much smaller context (a subagent / auxiliary request's
+    usage) or omit it entirely (reads as 0). Direct Anthropic doesn't do this.
+
+    We keep the last *stable* per-session value and:
+      - hold it when a refresh omits context (cur_used <= 0),
+      - hold it through a large single-refresh drop (transient dip),
+      - accept a large drop only once a second refresh confirms it (real
+        /compact), and accept growth / small changes immediately.
+
+    Returns (used_tokens, size) to display.
+    """
+    path = Path(state_path) if state_path else CTX_STATE_FILE
+    try:
+        st = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        st = {}
+    if st.get("session_id") != session_id:
+        st = {"session_id": session_id, "shown_used": 0,
+              "shown_size": cur_size or 0, "pend_used": None}
+
+    shown_used = st.get("shown_used", 0) or 0
+    shown_size = st.get("shown_size", 0) or 0
+
+    if not cur_used or cur_used <= 0:
+        # context omitted this refresh -> hold last stable value
+        out_used, out_size = shown_used, (shown_size or cur_size)
+    elif shown_used and cur_used < shown_used * 0.8:
+        # large drop: treat as a transient dip unless a 2nd read confirms it
+        pend = st.get("pend_used")
+        if pend and abs(cur_used - pend) <= max(2000, int(shown_used * 0.05)):
+            st["shown_used"], st["pend_used"] = cur_used, None
+            out_used = cur_used
+        else:
+            st["pend_used"] = cur_used
+            out_used = shown_used
+        out_size = cur_size or shown_size
+    else:
+        # growth or small change -> accept immediately
+        st["shown_used"], st["pend_used"] = cur_used, None
+        out_used, out_size = cur_used, (cur_size or shown_size)
+
+    if cur_size:
+        st["shown_size"] = cur_size
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(st), encoding="utf-8")
+    except OSError:
+        pass
+    return out_used, (out_size or cur_size)
+
 
 def parse_stdin_data() -> Dict[str, Any]:
     """Parse JSON data injected by Claude Code via stdin.
@@ -96,6 +154,20 @@ def parse_stdin_data() -> Dict[str, Any]:
             result['context_window_size'] = cw.get('context_window_size', 0)
             result['total_input_tokens'] = cw.get('total_input_tokens', 0)
             result['total_output_tokens'] = cw.get('total_output_tokens', 0)
+
+        # Debounce context to stop gateway-induced 0<->N flicker (litellm/OpenRouter).
+        # No-op for direct Anthropic, whose readings grow monotonically.
+        size = result.get('context_window_size', 0)
+        cur_used = result.get('total_input_tokens', 0) or 0
+        if not cur_used:
+            pct = result.get('context_used_pct', 0)
+            if pct and size:
+                cur_used = int(size * pct / 100)
+        sm_used, sm_size = _smooth_context(result.get('session_id', ''), cur_used, size)
+        if sm_size:
+            result['context_window_size'] = sm_size
+            result['context_used_pct'] = round(100.0 * sm_used / sm_size)
+        result['total_input_tokens'] = sm_used
 
         # Session cost
         cost = data.get('cost', {})
