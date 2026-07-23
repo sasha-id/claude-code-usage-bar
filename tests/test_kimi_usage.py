@@ -240,12 +240,32 @@ class TestKimiUsageCache:
 
     def test_missing_token_never_fetches(self, tmp_path):
         cache = tmp_path / "kimi_usage.json"
-        self._write_cache(cache, age_s=86400, token="")
+        self._write_cache(cache, age_s=86400, token="present")
 
         def boom(base, tok):
             raise AssertionError("fetch must not run without a token")
 
-        assert _kimi_usage("b", "", cache_path=cache, fetcher=boom) == GOOD
+        assert _kimi_usage("b", "", cache_path=cache, fetcher=boom) == {}
+
+    def test_failed_cache_write_still_throttles_refresh(self, monkeypatch, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
+        fetches = []
+
+        def fetch(base, token):
+            fetches.append(True)
+            return new
+
+        def fail_replace(src, dst):
+            raise OSError("read-only cache")
+
+        monkeypatch.setattr(core.os, "replace", fail_replace)
+
+        assert _kimi_usage("b", "t", cache_path=cache,
+                           fetcher=fetch) == new
+        assert _kimi_usage("b", "t", cache_path=cache,
+                           fetcher=fetch) == {}
+        assert fetches == [True]
 
     def test_corrupt_cache_is_treated_as_absent(self, tmp_path):
         cache = tmp_path / "kimi_usage.json"

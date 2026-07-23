@@ -127,14 +127,16 @@ same keys and is untouched.
 
 | Condition | Behavior |
 |---|---|
-| `ANTHROPIC_AUTH_TOKEN` unset on kimi backend | treat as fetch failure (serve stale cache, else omit cells) |
+| `ANTHROPIC_AUTH_TOKEN` unset on kimi backend | omit cells; cache identity cannot be verified without the token |
 | HTTP timeout / non-200 / bad JSON | serve stale cache; omit cells if no cache |
 | Weekly `usage` block missing | omit 7d cell only |
 | No 300-minute window in `limits[]` | omit 5h cell only |
 | Cache file unreadable/corrupt | treat as absent |
 
 The statusline hot path pays at most one ~2.5s-bounded HTTP call per 60s; all
-other renders read one small JSON file.
+other renders read one small JSON file. A successful fetch also updates a
+separate refresh marker, so a cache-payload write failure does not cause a
+request on every subsequent render.
 
 ### Testing
 

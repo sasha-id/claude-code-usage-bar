@@ -329,6 +329,24 @@ def _kimi_cache_is_fresh(cached: Optional[Dict[str, Any]]) -> bool:
     return math.isfinite(fetched_at) and 0 <= age < KIMI_USAGE_TTL_S
 
 
+def _kimi_refresh_marker_is_fresh(path: Path) -> bool:
+    marker = path.with_name(f"{path.name}.refresh")
+    try:
+        age = time.time() - marker.stat().st_mtime
+    except OSError:
+        return False
+    return math.isfinite(age) and 0 <= age < KIMI_USAGE_TTL_S
+
+
+def _mark_kimi_refresh(path: Path) -> None:
+    marker = path.with_name(f"{path.name}.refresh")
+    try:
+        marker.touch(mode=0o600, exist_ok=True)
+        os.utime(marker, None)
+    except OSError:
+        pass
+
+
 def _kimi_usage(base_url: str, token: str, *, cache_path=None, fetcher=None) -> dict:
     """Kimi quota with a TTL file cache and an exclusive refresh lease.
     Fresh cache wins; concurrent stale renders serve the cache while its owner
@@ -343,6 +361,8 @@ def _kimi_usage(base_url: str, token: str, *, cache_path=None, fetcher=None) -> 
     if _kimi_cache_is_fresh(cached):
         return cached.get("limits") or {}
     if not token:
+        return {}
+    if _kimi_refresh_marker_is_fresh(path):
         return (cached or {}).get("limits") or {}
 
     lease = _claim_file_lease(path, KIMI_USAGE_LEASE_S)
@@ -374,6 +394,7 @@ def _kimi_usage(base_url: str, token: str, *, cache_path=None, fetcher=None) -> 
             os.chmod(path, 0o600)
         except OSError:
             pass
+        _mark_kimi_refresh(path)
         return limits
     finally:
         _release_file_lease(lease)
