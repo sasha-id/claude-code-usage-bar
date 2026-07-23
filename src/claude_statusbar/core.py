@@ -9,6 +9,7 @@ the hot path.
 """
 
 import json
+import math
 import re
 import sys
 import logging
@@ -55,10 +56,12 @@ def _smooth_context(session_id, cur_used, cur_size, state_path=None):
 
     shown_used = st.get("shown_used", 0) or 0
     shown_size = st.get("shown_size", 0) or 0
+    hold_previous_size = False
 
     if not cur_used or cur_used <= 0:
         # context omitted this refresh -> hold last stable value
         out_used, out_size = shown_used, (shown_size or cur_size)
+        hold_previous_size = True
     elif shown_used and cur_used < shown_used * 0.8:
         # large drop: treat as a transient dip unless a 2nd read confirms it
         pend = st.get("pend_used")
@@ -68,13 +71,14 @@ def _smooth_context(session_id, cur_used, cur_size, state_path=None):
         else:
             st["pend_used"] = cur_used
             out_used = shown_used
-        out_size = cur_size or shown_size
+            hold_previous_size = True
+        out_size = shown_size or cur_size
     else:
         # growth or small change -> accept immediately
         st["shown_used"], st["pend_used"] = cur_used, None
         out_used, out_size = cur_used, (cur_size or shown_size)
 
-    if cur_size:
+    if cur_size and not hold_previous_size:
         st["shown_size"] = cur_size
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,22 +88,72 @@ def _smooth_context(session_id, cur_used, cur_size, state_path=None):
     return out_used, (out_size or cur_size)
 
 
+def _is_kimi_url(base_url: str) -> bool:
+    parsed = urlparse(base_url)
+    host = parsed.hostname or ""
+    return (parsed.scheme == "https"
+            and (host == "kimi.com" or host.endswith(".kimi.com")))
+
+
 def _backend() -> str:
     """Which credential backend this session runs on, from the env Claude Code
     passes to the status line. The nyx launcher strips ANTHROPIC_BASE_URL on the
-    default (nyx auth) path, so absence means the Anthropic subscription; a
-    *.kimi.com host is the kimi-k3 byo backend; anything else is a byo host we
-    have no usage provider for."""
+    default (nyx auth) path, so absence means the Anthropic subscription; an
+    HTTPS *.kimi.com host is the kimi-k3 byo backend; anything else is a byo
+    host we have no usage provider for."""
     base = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
     if not base:
         return "default"
-    host = urlparse(base).hostname or ""
-    if host == "kimi.com" or host.endswith(".kimi.com"):
+    if _is_kimi_url(base):
         return "kimi"
     return "other"
 
 
-def _parse_kimi_window(detail: dict) -> dict | None:
+def _valid_kimi_window(window: Any) -> Optional[Dict[str, Any]]:
+    """Return one normalized cached Kimi window, or None when invalid."""
+    if not isinstance(window, dict):
+        return None
+    pct = window.get("pct")
+    resets_at = window.get("resets_at")
+    if (isinstance(pct, bool) or not isinstance(pct, (int, float))
+            or isinstance(resets_at, bool)
+            or not isinstance(resets_at, (int, float))):
+        return None
+    try:
+        pct_value = float(pct)
+        reset_value = float(resets_at)
+    except (OverflowError, ValueError):
+        return None
+    if (not math.isfinite(pct_value) or not math.isfinite(reset_value)
+            or pct_value < 0 or reset_value <= 0
+            or int(resets_at) != resets_at):
+        return None
+    try:
+        reset_epoch = int(resets_at)
+        datetime.fromtimestamp(reset_epoch, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return {"pct": pct_value, "resets_at": reset_epoch}
+
+
+def _valid_kimi_limits(limits: Any) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Keep valid known Kimi windows and reject an entirely invalid schema."""
+    if not isinstance(limits, dict):
+        return None
+    out = {}
+    invalid_window = False
+    for name in ("five_hour", "seven_day"):
+        if name not in limits:
+            continue
+        window = _valid_kimi_window(limits[name])
+        if window is None:
+            invalid_window = True
+        else:
+            out[name] = window
+    return None if invalid_window and not out else out
+
+
+def _parse_kimi_window(detail: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """One Kimi quota window ({limit, used, resetTime}, all strings) ->
     {"pct": 0-100, "resets_at": epoch} or None when it doesn't parse."""
     try:
@@ -109,16 +163,20 @@ def _parse_kimi_window(detail: dict) -> dict | None:
             detail["resetTime"].replace("Z", "+00:00")).timestamp())
     except (TypeError, ValueError, KeyError, AttributeError):
         return None
-    if limit <= 0:
+    if not math.isfinite(limit) or not math.isfinite(used) or limit <= 0:
         return None
-    return {"pct": used / limit * 100.0, "resets_at": resets_at}
+    return _valid_kimi_window({"pct": used / limit * 100.0,
+                               "resets_at": resets_at})
 
 
 def _fetch_kimi_usage(base_url: str, token: str) -> dict:
     """GET <base_url>/v1/usages and map Kimi's quota onto our two windows:
     weekly (top-level `usage`) -> seven_day, the 300-minute rolling window in
     `limits[]` -> five_hour. Windows that don't parse are omitted, not fatal.
-    Raises on transport/HTTP/JSON errors — the caller (_kimi_usage) degrades."""
+    Raises on an unsafe URL or transport/HTTP/JSON errors — the caller
+    (_kimi_usage) degrades."""
+    if not _is_kimi_url(base_url):
+        raise ValueError("Kimi usage requests require an HTTPS kimi.com URL")
     req = urllib.request.Request(
         base_url.rstrip("/") + "/v1/usages",
         headers={"Authorization": f"Bearer {token}", "User-Agent": "KimiCLI/1.6"})
@@ -152,46 +210,119 @@ def _fetch_kimi_usage(base_url: str, token: str) -> dict:
 
 KIMI_USAGE_CACHE = Path.home() / ".cache" / "claude-statusbar" / "kimi_usage.json"
 KIMI_USAGE_TTL_S = 60
+KIMI_USAGE_LEASE_S = 10
+
+
+def _read_kimi_cache(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(cached, dict):
+        return None
+    limits = _valid_kimi_limits(cached.get("limits"))
+    if limits is None:
+        return None
+    return {"fetched_at": cached.get("fetched_at"), "limits": limits}
+
+
+def _kimi_cache_is_fresh(cached: Optional[Dict[str, Any]]) -> bool:
+    if cached is None:
+        return False
+    try:
+        fetched_at = float(cached.get("fetched_at"))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (math.isfinite(fetched_at)
+            and time.time() - fetched_at < KIMI_USAGE_TTL_S)
+
+
+def _claim_kimi_usage_lease(path: Path):
+    """Atomically claim the short refresh lease, or None when one is active."""
+    lease_path = path.with_name(f"{path.name}.lock")
+    lease = f"{os.getpid()}-{time.time_ns()}"
+    try:
+        lease_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    for _ in range(2):
+        try:
+            fd = os.open(str(lease_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                         0o600)
+        except FileExistsError:
+            try:
+                if time.time() - lease_path.stat().st_mtime <= KIMI_USAGE_LEASE_S:
+                    return None
+                lease_path.unlink()
+            except OSError:
+                return None
+            continue
+        except OSError:
+            return None
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
+                lock_file.write(lease)
+        except OSError:
+            try:
+                lease_path.unlink()
+            except OSError:
+                pass
+            return None
+        return lease_path, lease
+    return None
+
+
+def _release_kimi_usage_lease(lease) -> None:
+    if lease is None:
+        return
+    lease_path, lease_value = lease
+    try:
+        if lease_path.read_text(encoding="utf-8") == lease_value:
+            lease_path.unlink()
+    except OSError:
+        pass
 
 
 def _kimi_usage(base_url: str, token: str, *, cache_path=None, fetcher=None) -> dict:
-    """Kimi quota with a TTL file cache: at most one HTTP call per
-    KIMI_USAGE_TTL_S across the status line's rapid renders. Fresh cache wins;
-    on any fetch failure the stale cache is served regardless of age; no cache
-    + failure -> {} (limit cells omitted). A missing token never fetches.
-    The token is used only in the request header — never cached or logged."""
+    """Kimi quota with a TTL file cache and an exclusive refresh lease.
+    Fresh cache wins; concurrent stale renders serve the cache while its owner
+    fetches. On any fetch failure the stale cache is served regardless of age;
+    no cache + failure -> {} (limit cells omitted). A missing token never
+    fetches. The token is used only in the request header — never cached or
+    logged."""
     path = Path(cache_path) if cache_path else KIMI_USAGE_CACHE
     fetch = fetcher or _fetch_kimi_usage
-    try:
-        cached = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(cached, dict):
-            cached = None
-    except (OSError, ValueError):
-        cached = None
-    if cached is not None and not isinstance(cached.get("limits"), dict):
-        cached = None
-    try:
-        fresh = (cached is not None
-                 and time.time() - float(cached.get("fetched_at", 0)) < KIMI_USAGE_TTL_S)
-    except (TypeError, ValueError):
-        fresh = False
-    if fresh:
+    cached = _read_kimi_cache(path)
+    if _kimi_cache_is_fresh(cached):
         return cached.get("limits") or {}
     if not token:
         return (cached or {}).get("limits") or {}
+
+    lease = _claim_kimi_usage_lease(path)
+    if lease is None:
+        refreshed = _read_kimi_cache(path)
+        return (refreshed or cached or {}).get("limits") or {}
     try:
-        limits = fetch(base_url, token)
-    except Exception:
-        return (cached or {}).get("limits") or {}
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps({"fetched_at": time.time(), "limits": limits}),
-                       encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError:
-        pass
-    return limits
+        cached = _read_kimi_cache(path)
+        if _kimi_cache_is_fresh(cached):
+            return cached.get("limits") or {}
+        try:
+            limits = _valid_kimi_limits(fetch(base_url, token))
+        except Exception:
+            return (cached or {}).get("limits") or {}
+        if limits is None:
+            return (cached or {}).get("limits") or {}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps({"fetched_at": time.time(), "limits": limits}),
+                           encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+        return limits
+    finally:
+        _release_kimi_usage_lease(lease)
 
 
 def parse_stdin_data() -> Dict[str, Any]:
@@ -212,8 +343,10 @@ def parse_stdin_data() -> Dict[str, Any]:
         debug_file = Path.home() / ".cache" / "claude-statusbar" / "last_stdin.json"
         data = json.loads(raw)
 
-        # Only cache stdin when it contains rate_limits (avoid overwriting with empty data)
-        if data.get('rate_limits', {}).get('five_hour'):
+        backend = _backend()
+
+        # Only default-backend rate limits can seed the Anthropic fallback.
+        if backend == "default" and data.get('rate_limits', {}).get('five_hour'):
             try:
                 debug_file.parent.mkdir(parents=True, exist_ok=True)
                 debug_file.write_text(raw, encoding="utf-8")
@@ -238,14 +371,14 @@ def parse_stdin_data() -> Dict[str, Any]:
         # Kimi's coding-plan quota from its usages API. The Anthropic fallback
         # must NOT run on a byo backend — it would show a subscription the
         # session isn't consuming (the stale-numbers-on-kimi bug).
-        if _backend() == "kimi":
+        if backend == "kimi":
             usage = _kimi_usage(os.environ.get("ANTHROPIC_BASE_URL", ""),
                                 os.environ.get("ANTHROPIC_AUTH_TOKEN", ""))
-            five = usage.get("five_hour")
+            five = _valid_kimi_window(usage.get("five_hour"))
             if five:
                 result['rate_limit_pct'] = five['pct']
                 result['rate_limit_resets_at'] = five['resets_at']
-            seven = usage.get("seven_day")
+            seven = _valid_kimi_window(usage.get("seven_day"))
             if seven:
                 result['rate_limit_7d_pct'] = seven['pct']
                 result['rate_limit_7d_resets_at'] = seven['resets_at']

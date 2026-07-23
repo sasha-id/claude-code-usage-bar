@@ -36,6 +36,20 @@ def test_absent_context_holds_last(tmp_path):
     assert used == 200000
 
 
+def test_absent_context_holds_prior_context_size(tmp_path):
+    sp = _state(tmp_path)
+    SID = "sess-B-size"
+    _smooth_context(SID, 250000, 1_000_000, sp)
+
+    used, size = _smooth_context(SID, 0, 100000, sp)
+
+    assert used == 250000
+    assert size == 1_000_000
+
+    _, size = _smooth_context(SID, 0, 0, sp)
+    assert size == 1_000_000
+
+
 def test_growth_passes_through_immediately(tmp_path):
     sp = _state(tmp_path)
     SID = "sess-C"
@@ -56,6 +70,17 @@ def test_confirmed_drop_is_accepted(tmp_path):
     # ...but a second, consistent low reading confirms it -> accepted
     used, _ = _smooth_context(SID, 41000, 1_000_000, sp)
     assert used == 41000
+
+
+def test_transient_dip_holds_prior_context_size(tmp_path):
+    sp = _state(tmp_path)
+    SID = "sess-size"
+    _smooth_context(SID, 250000, 1_000_000, sp)
+
+    used, size = _smooth_context(SID, 40000, 100000, sp)
+
+    assert used == 250000
+    assert size == 1_000_000
 
 
 def test_new_session_resets(tmp_path):

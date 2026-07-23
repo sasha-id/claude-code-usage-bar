@@ -3,6 +3,7 @@ import io
 import json
 import sys
 import time
+from threading import Event, Thread
 
 import pytest
 
@@ -31,6 +32,10 @@ class TestBackend:
     def test_kimi_apex_host_is_kimi(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://kimi.com/coding")
         assert _backend() == "kimi"
+
+    def test_http_kimi_host_is_not_kimi(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://api.kimi.com/coding")
+        assert _backend() == "other"
 
     def test_lookalike_host_is_not_kimi(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://notkimi.com/v1")
@@ -126,6 +131,32 @@ class TestFetchKimiUsage:
         assert "five_hour" not in out
         assert out["seven_day"]["pct"] == pytest.approx(12.0)
 
+    def test_http_url_never_sends_bearer_token(self, monkeypatch):
+        calls = _mock_urlopen(monkeypatch, LIVE_PAYLOAD)
+        with pytest.raises(ValueError, match="HTTPS"):
+            _fetch_kimi_usage("http://api.kimi.com/coding", "tok")
+        assert calls == []
+
+    def test_non_finite_api_values_are_omitted(self, monkeypatch):
+        payload = {
+            "usage": {"limit": "NaN", "used": "12",
+                      "resetTime": LIVE_PAYLOAD["usage"]["resetTime"]},
+            "limits": [
+                {"window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                 "detail": {"limit": "100", "used": "Infinity",
+                            "resetTime": LIVE_PAYLOAD["limits"][0]["detail"]["resetTime"]}},
+            ],
+        }
+        _mock_urlopen(monkeypatch, payload)
+        assert _fetch_kimi_usage("https://api.kimi.com/coding", "tok") == {}
+
+    def test_over_limit_percentage_is_preserved(self, monkeypatch):
+        payload = {"usage": {**LIVE_PAYLOAD["usage"], "used": "120"},
+                   "limits": []}
+        _mock_urlopen(monkeypatch, payload)
+        out = _fetch_kimi_usage("https://api.kimi.com/coding", "tok")
+        assert out["seven_day"]["pct"] == pytest.approx(120.0)
+
 
 GOOD = {"five_hour": {"pct": 16.0, "resets_at": 1784821868},
         "seven_day": {"pct": 12.0, "resets_at": 1785336668}}
@@ -196,6 +227,13 @@ class TestKimiUsageCache:
         out = _kimi_usage("b", "t", cache_path=cache, fetcher=lambda b, t: new)
         assert out == new
 
+    def test_impossible_fetched_at_is_treated_as_stale(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        cache.write_text(json.dumps({"fetched_at": 10 ** 1000, "limits": GOOD}))
+        new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
+        out = _kimi_usage("b", "t", cache_path=cache, fetcher=lambda b, t: new)
+        assert out == new
+
     def test_non_dict_limits_treated_as_absent(self, tmp_path):
         cache = tmp_path / "kimi_usage.json"
         cache.write_text(json.dumps({"fetched_at": time.time(), "limits": [1, 2]}))
@@ -204,6 +242,61 @@ class TestKimiUsageCache:
             raise OSError("down")
 
         assert _kimi_usage("b", "t", cache_path=cache, fetcher=fail) == {}
+
+    def test_incomplete_fresh_cache_omits_only_invalid_window(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        self._write_cache(cache, age_s=10, limits={
+            "five_hour": {"pct": 16.0},
+            "seven_day": GOOD["seven_day"],
+        })
+
+        def boom(base, tok):
+            raise AssertionError("valid cached window must not fetch")
+
+        assert _kimi_usage("b", "t", cache_path=cache, fetcher=boom) == {
+            "seven_day": GOOD["seven_day"],
+        }
+
+    def test_impossible_reset_epoch_is_omitted_from_fresh_cache(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        self._write_cache(cache, age_s=10, limits={
+            "five_hour": {"pct": 16.0, "resets_at": 10 ** 1000},
+            "seven_day": GOOD["seven_day"],
+        })
+
+        assert _kimi_usage("b", "", cache_path=cache) == {
+            "seven_day": GOOD["seven_day"],
+        }
+
+    def test_concurrent_stale_cache_refresh_uses_one_fetch(self, tmp_path):
+        cache = tmp_path / "kimi_usage.json"
+        self._write_cache(cache, age_s=3600)
+        fetch_started = Event()
+        allow_first_fetch_to_finish = Event()
+        first_result = []
+        second_fetches = []
+
+        def first_fetch(base, token):
+            fetch_started.set()
+            assert allow_first_fetch_to_finish.wait(timeout=1)
+            return {"five_hour": {"pct": 1.0, "resets_at": 2}}
+
+        def second_fetch(base, token):
+            second_fetches.append(True)
+            return {"five_hour": {"pct": 2.0, "resets_at": 3}}
+
+        thread = Thread(target=lambda: first_result.append(
+            _kimi_usage("b", "t", cache_path=cache, fetcher=first_fetch)))
+        thread.start()
+        assert fetch_started.wait(timeout=1)
+        assert _kimi_usage("b", "t", cache_path=cache,
+                           fetcher=second_fetch) == GOOD
+        allow_first_fetch_to_finish.set()
+        thread.join(timeout=1)
+
+        assert not thread.is_alive()
+        assert first_result == [{"five_hour": {"pct": 1.0, "resets_at": 2}}]
+        assert second_fetches == []
 
 
 def _run_parse(monkeypatch, tmp_path, payload, env):
@@ -262,3 +355,13 @@ class TestParseStdinData:
         (cache / "last_stdin.json").write_text(json.dumps(STDIN_RL))
         out = _run_parse(monkeypatch, tmp_path, {"model": {}}, env={})
         assert out["rate_limit_pct"] == 42.0
+
+    def test_kimi_rate_limits_do_not_seed_default_cache(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(core, "_kimi_usage", lambda b, t: GOOD)
+        _run_parse(monkeypatch, tmp_path, STDIN_RL, env={
+            "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
+            "ANTHROPIC_AUTH_TOKEN": "tok"})
+
+        out = _run_parse(monkeypatch, tmp_path, {"model": {}}, env={})
+        assert "rate_limit_pct" not in out
+        assert "rate_limit_7d_pct" not in out
