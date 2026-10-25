@@ -54,11 +54,37 @@ def test_core_renders_projection_when_enabled(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(sys, "stdin", io.StringIO(_payload()))
 
     from claude_statusbar.core import main
-    main(use_color=False, _suppress_side_effects=True)
+    main(use_color=False, style_override="classic", _suppress_side_effects=True)
 
     out = capsys.readouterr().out
     assert "→50%" in out
     assert "→90%" in out
+
+
+def test_aurora_skips_estimate_collection(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config_path = _write_config(tmp_path, show_projection=True,
+                                show_forecast=True, style="aurora")
+    import claude_statusbar.config as config
+    monkeypatch.setattr(config, "CONFIG_PATH", config_path)
+    import claude_statusbar.predict as predict
+    projection_calls = []
+    forecast_calls = []
+    monkeypatch.setattr(predict, "projection",
+                        lambda *a, **k: projection_calls.append((a, k)) or ("→50%", "→90%"))
+    monkeypatch.setattr(predict, "forecast",
+                        lambda *a, **k: forecast_calls.append((a, k)) or ("~8m", ""))
+    monkeypatch.setattr(sys, "stdin", io.StringIO(_payload()))
+
+    from claude_statusbar.core import main
+    main(use_color=False, _suppress_side_effects=True)
+
+    out = capsys.readouterr().out
+    assert projection_calls == []
+    assert forecast_calls == []
+    assert "→50%" not in out
+    assert "→90%" not in out
+    assert "~8m" not in out
 
 
 def test_core_hides_projection_when_disabled(tmp_path, monkeypatch, capsys):

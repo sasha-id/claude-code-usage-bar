@@ -25,7 +25,7 @@ def test_main_survives_forecast_exception(tmp_path, monkeypatch, capsys):
                         "seven_day": {"used_percentage": 5, "resets_at": 9999999999}}})
     monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
     from claude_statusbar.core import main
-    main(use_color=False, _suppress_side_effects=True)
+    main(use_color=False, style_override="classic", _suppress_side_effects=True)
     assert "Opus 4.8" in capsys.readouterr().out   # bar still rendered, no blank
 
 
@@ -46,5 +46,5 @@ def test_chip_appears_when_forecast_returns_one(tmp_path, monkeypatch, capsys):
                         "seven_day": {"used_percentage": 5, "resets_at": 9999999999}}})
     monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
     from claude_statusbar.core import main
-    main(use_color=False, _suppress_side_effects=True)
+    main(use_color=False, style_override="classic", _suppress_side_effects=True)
     assert "~8m" in capsys.readouterr().out   # chip plumbed to the bar

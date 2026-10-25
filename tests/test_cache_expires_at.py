@@ -11,7 +11,7 @@ import re
 import sys
 import time
 
-from claude_statusbar import core
+from claude_statusbar import config, core
 from claude_statusbar.activity import format_cache_remaining
 
 
@@ -62,8 +62,13 @@ def test_render_prefers_expires_at_over_an_old_transcript(tmp_path, monkeypatch,
     fake.isatty = lambda: False
     monkeypatch.setattr(sys, "stdin", fake)
     monkeypatch.setenv("HOME", str(tmp_path))
-    core.main(use_color=False, _suppress_side_effects=True)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "show_cache_age": True, "show_project_branch": False,
+        "show_per_model": False, "show_todos": False, "show_fp_risk": False,
+    }))
+    monkeypatch.setattr(config, "CONFIG_PATH", config_path)
+    core.main(use_color=False, style_override="classic", _suppress_side_effects=True)
     out = capsys.readouterr().out
     assert "COLD" not in out
-    # classic prints `cache 49m59s`, aurora (the default since 3.47.1) `❄ 49m`.
-    assert re.search(r"(cache|❄) (49|50)m", out), out
+    assert re.search(r"cache (49|50)m", out), out

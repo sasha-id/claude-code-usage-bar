@@ -1330,7 +1330,7 @@ def main(json_output: bool = False,
     # Optional cache age segment — from the shared scan when we did one, else
     # the standalone reader (cache-only render, no transcript, or scan failed).
     cache_age_text = ""
-    if cfg.show_cache_age:
+    if cfg.show_cache_age and chosen_style != "aurora":
         _expires_at = stdin_data.get("prompt_cache_expires_at")
         if _expires_at is not None:
             import time as _t
@@ -1350,12 +1350,21 @@ def main(json_output: bool = False,
         import time as _t
         shimmer_phase = int(_t.time())
 
-    # Cheap session stats from stdin (no transcript scan). Rendered on the
-    # identity line — next to the project — rather than alone on the activity
-    # line. (They therefore appear only when show_project_branch is on.)
-    from .activity import format_duration_short, format_lines
-    duration_text = (format_duration_short(stdin_data.get("total_duration_ms", 0))
-                     if cfg.show_duration else "")
+    # Cheap session stats from stdin (no transcript scan). Aurora carries the
+    # duration inline; classic appends stats to its identity line.
+    from .activity import (format_duration_short, format_elapsed_short,
+                           format_lines)
+    duration_text = ""
+    if cfg.show_duration:
+        duration_ms = stdin_data.get("total_duration_ms", 0)
+        if chosen_style == "aurora":
+            try:
+                seconds = int(duration_ms) // 1000
+            except (TypeError, ValueError):
+                seconds = 0
+            duration_text = format_elapsed_short(seconds) if seconds > 0 else ""
+        else:
+            duration_text = format_duration_short(duration_ms)
     lines_text = (format_lines(stdin_data.get("lines_added", 0),
                                stdin_data.get("lines_removed", 0))
                   if cfg.show_lines else "")
@@ -1642,7 +1651,8 @@ def main(json_output: bool = False,
                 countdown = get_countdown_emoji(minutes_to_reset)
 
                 projection_kwargs = {}
-                if cfg.show_projection and not stdin_data.get('_kimi_quota'):
+                if (cfg.show_projection and chosen_style != "aurora"
+                        and not stdin_data.get('_kimi_quota')):
                     try:
                         import time as _t
                         from .predict import projection
@@ -1660,7 +1670,8 @@ def main(json_output: bool = False,
                         projection_kwargs = {}
 
                 forecast_kwargs = {}
-                if cfg.show_forecast and not stdin_data.get('_kimi_quota'):
+                if (cfg.show_forecast and chosen_style != "aurora"
+                        and not stdin_data.get('_kimi_quota')):
                     try:
                         import time as _t
                         from .predict import forecast

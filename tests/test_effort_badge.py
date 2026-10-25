@@ -24,11 +24,12 @@ def _render(style, **changes):
     ("aurora", "block", "■"),
     ("aurora", "thin", "━"),
 ])
-def test_aurora_badge_sits_between_model_and_context_bar(style, bar_glyph, cell):
+def test_aurora_badge_sits_between_model_and_context_totals(style, bar_glyph, cell):
     out = _render(style, bar_glyph=bar_glyph)
 
-    assert f"Kimi K3 ✳xhigh↯ {cell}" in out
-    assert "35% · 350.0k/1.0M" in out
+    assert "Kimi K3 ✳xhigh↯ 350.0k/1.0M" in out
+    assert "35%" not in out
+    assert f"↯ {cell}" not in out
     assert "Kimi K3(" not in out
     assert "effort:" not in out
     assert len(out.splitlines()) == 1
@@ -42,8 +43,9 @@ def test_aurora_narrow_layout_keeps_context_totals(style, bar_glyph, cell):
     out = _render(style, bar_glyph=bar_glyph, max_width=55,
                   narrow_layout="stack")
 
-    assert "35% · 350.0k/1.0M" in out
-    assert f"Kimi K3 ✳xhigh↯ {cell}" in out
+    assert "Kimi K3 ✳xhigh↯ 350.0k/1.0M" in out
+    assert "35%" not in out
+    assert f"↯ {cell}" not in out
 
 
 def test_classic_badge_follows_context_suffix():

@@ -154,7 +154,7 @@ def _align_quotas(quota: list, max_width: int) -> list:
 
 
 def _stack(segs: list, sep: str, labels: list, scoped: list,
-           max_width: int) -> str:
+           max_width: int, compact_quota: bool = False) -> str:
     """Re-flow a too-wide line 1 instead of dropping segments (#73).
 
     The leading `labels` segments are quota bars; `scoped` adds
@@ -167,7 +167,9 @@ def _stack(segs: list, sep: str, labels: list, scoped: list,
     """
     quota = list(zip(labels, segs)) + list(scoped)
     rest = segs[len(labels):]
-    row = sep.join(seg for _, seg in quota)
+    row = quota[0][1]
+    for index, (_, seg) in enumerate(quota[1:], 1):
+        row += (" " if compact_quota and index == 1 else sep) + seg
     if visible_width(row) <= max_width:
         lines, cur = [], row
     else:
@@ -190,43 +192,28 @@ def _stack(segs: list, sep: str, labels: list, scoped: list,
 # Style: aurora — ■ (or thin ━) bars whose cells blend ok→warn→hot by position
 # ---------------------------------------------------------------------------
 _AURORA_TOKENS_RE = _re.compile(r"\s*\([^()\n]*\)$")
-_AURORA_SECS_RE = _re.compile(r"(\d+)m\d+s$")
-
-
-def _aurora_cache_text(text: str) -> str:
-    """Drop the seconds once they stop mattering: `1h00m00s` → `1h00m`,
-    `59m12s` → `59m`. Under 10 minutes the seconds stay (`4m23s`)."""
-    m = _AURORA_SECS_RE.search(text)
-    if m and ("h" in text or int(m.group(1)) >= 10):
-        return text[:m.end(1)] + "m"
-    return text
 
 
 def render_aurora(
     *, msgs_pct, weekly_pct, reset_5h, reset_7d, model,
-    lang_body="", cost_text="", cache_age_text="", bypass=False,
+    lang_body="", cost_text="", bypass=False,
     use_color=True, theme: Optional[Theme]=None,
     warning_threshold=30.0, critical_threshold=70.0,
     density: str = "regular",
     bar_glyph: str = "block",
     show_weekly: bool = True,
     ctx_pct: Optional[float] = None,
-    projection_5h: str = "",
-    projection_7d: str = "",
-    forecast_5h: str = "",
-    forecast_7d: str = "",
-    countdown_emoji: str = "",
     effort_level: str = "",
     thinking_enabled=None,
     fast_mode=None,
     no_quota: bool = False,
     balance_text: str = "",
     quota_stale: bool = False,
+    identity_text: str = "",
     _segments=None,
     **_ignored,
 ) -> str:
-    from .progress import (window_severity_rgb, _blend, projection_pct,
-                           _render_projection, _render_forecast,
+    from .progress import (window_severity_rgb, _blend,
                            CONTEXT_WARNING_THRESHOLD as _CW,
                            CONTEXT_CRITICAL_THRESHOLD as _CC)
     theme = theme or get_theme("graphite")
@@ -261,17 +248,11 @@ def render_aurora(
         col = _fg(rgb) if rgb is not None else INK
         return f"{col}{BOLD}{int(round(p)):>2}%{RESET}"
 
-    def window(label, p, chip, forecast, reset, emoji=""):
-        rgb = window_severity_rgb(p, chip, theme,
+    def window(label, p, reset):
+        rgb = window_severity_rgb(p, "", theme,
                                   warning_threshold, critical_threshold)
-        out = (f"{MUTE}{label}{RESET} {bar(p, 12)} {pct_text(p, rgb)} "
-               f"{EDGE}⏰{MUTE}{reset or '--'}{emoji}{RESET}")
-        if chip:
-            out += " " + _render_projection(chip, theme, True)
-        # Same rule as classic: a usable projection wins over the ⚠ forecast.
-        if forecast and projection_pct(chip) is None:
-            out += " " + _render_forecast(forecast, theme, True)
-        return out
+        return (f"{MUTE}{label}{RESET} {bar(p, 8)} {pct_text(p, rgb)} "
+                f"{MUTE}{reset or '--'}{RESET}")
 
     sep = _line_separator(render_aurora, theme, density)
     parts = []
@@ -282,16 +263,12 @@ def render_aurora(
     elif quota_stale and msgs_pct is None and weekly_pct is None:
         parts.append(f"{_fg(theme.s_warn)}⟳ 5h/7d stale·restart{RESET}")
     else:
-        parts.append(window("5h", msgs_pct, projection_5h, forecast_5h,
-                            reset_5h, countdown_emoji))
+        parts.append(window("5h", msgs_pct, reset_5h))
         if show_weekly:
-            parts.append(window("7d", weekly_pct, projection_7d, forecast_7d,
-                                reset_7d))
+            parts.append(window("7d", weekly_pct, reset_7d))
 
-    # The mini bar carries context fill; keep the used/total suffix beside its
-    # percentage so the absolute window size remains visible too.
-    # A rose between the hot and worktree hues — reads as "the model", never
-    # as a severity, and follows each theme's palette.
+    # The model keeps its effort badge and absolute context totals, without a
+    # second context bar duplicating the quota bars.
     accent = _fg(_blend(theme.s_hot, theme.wt, 0.5))
     badge = _effort_badge(effort_level, thinking_enabled, fast_mode,
                           theme=theme, use_color=use_color)
@@ -301,12 +278,13 @@ def render_aurora(
         context_match = _AURORA_TOKENS_RE.search(model_text)
         name = _AURORA_TOKENS_RE.sub("", model_text)
         context_text = context_match.group(0).strip()[1:-1] if context_match else ""
-        context_suffix = f"{MUTE} · {context_text}{RESET}" if context_text else ""
-        rgb = _severity_color(theme, ctx_pct, _CW, _CC)
-        parts.append(f"{accent}{name}{RESET}{badge_text} {bar(ctx_pct, 6)} "
-                     f"{_fg(rgb)}{int(round(ctx_pct))}%{RESET}{context_suffix}")
+        context_suffix = f" {MUTE}{context_text}{RESET}" if context_text else ""
+        parts.append(f"{accent}{name}{RESET}{badge_text}{context_suffix}")
     else:
         parts.append(f"{accent}{model}{RESET}{badge_text}")
+
+    if identity_text:
+        parts.append(identity_text)
 
     if balance_text:
         parts.append(f"{_fg(theme.s_ok)}{balance_text}{RESET}")
@@ -316,14 +294,14 @@ def render_aurora(
     if lang_body:
         parts.append(f"{MUTE}{lang_body}{RESET}")
 
-    if cache_age_text:
-        col = _fg(_cache_severity(theme, cache_age_text))
-        parts.append(f"{col}❄ {_aurora_cache_text(cache_age_text)}{RESET}")
-
     if bypass:
         parts.append(f"{_fg(theme.s_hot)}{BOLD}⚠ BYPASS{RESET}")
 
-    line = sep.join(parts)
+    compact_quota = (not no_quota and show_weekly
+                     and not (quota_stale and msgs_pct is None and weekly_pct is None))
+    line = parts[0]
+    for index, part in enumerate(parts[1:], 1):
+        line += (" " if compact_quota and index == 1 else sep) + part
     if _segments is not None:
         _segments.extend(parts if use_color else [_strip(part) for part in parts])
     if not use_color:
@@ -392,12 +370,7 @@ def render_classic(
     )
     if cache_age_text:
         # Three-level severity: COLD red, <1m yellow, otherwise green.
-        if cache_age_text == "COLD":
-            col = _fg(theme.s_hot)
-        elif "m" in cache_age_text or "h" in cache_age_text:
-            col = _fg(theme.s_ok)
-        else:
-            col = _fg(theme.s_warn)
+        col = _fg(_cache_severity(theme, cache_age_text))
         mute = _fg(theme.mute)
         reset = RESET if use_color else ""  # don't leak a bare RESET in no-color mode
         result += f"{reset}{colorize(' | ', mute, use_color)}{colorize(f'cache {cache_age_text}', col, use_color)}"
@@ -449,7 +422,7 @@ def _stats_segment(duration_text: str, lines_text: str, *, theme: Theme,
     return f" {MUTE}·{RESET} " + sep.join(segs)
 
 
-def _worktree_label(info, glyph: str = "🌳") -> str:
+def _worktree_label(info, glyph: str = "🌳", include_count: bool = True) -> str:
     """Display name for a linked worktree checkout.
 
     The worktree's own name, with a redundant repo prefix trimmed
@@ -469,7 +442,7 @@ def _worktree_label(info, glyph: str = "🌳") -> str:
     # actually forget once you keep parallel checkouts around. A plain total,
     # not an ordinal: "which one of N am I" is already answered by the name.
     total = getattr(info, "worktree_count", 0) or 0
-    return f"{name} ({glyph}{total})" if total else name
+    return f"{name} ({glyph}{total})" if include_count and total else name
 
 
 def render_identity_line(info, *, theme: Theme, dirty,
@@ -589,6 +562,41 @@ def _aurora_quiet(theme: Theme):
 # Lines below aurora's first use a faint dot, not `│`: stacked `│`s at
 # unrelated offsets read as a misaligned table.
 _QUIET_SEP = "  ·  "
+
+
+def _render_identity_segment_aurora(info, *, theme: Theme, dirty,
+                                    ahead=None, behind=None,
+                                    duration_text: str = "",
+                                    use_color: bool = True) -> str:
+    """Inline branch/worktree identity and session duration for Aurora."""
+    q = _aurora_quiet(theme)
+    BASE, DIM, _, soft = q["BASE"], q["DIM"], q["EDGE"], q["soft"]
+    from ._display import hyperlink
+    from .identity import branch_web_url
+
+    def c(color, text):
+        return f"{color}{text}{RESET}" if use_color else text
+
+    parts = []
+    if info.in_git:
+        branch = info.branch or "?"
+        head = c(DIM, "⎇ ")
+        branch_text = c(f"{DIM}{ITAL}" if info.detached else BASE, branch)
+        url = None if info.detached else branch_web_url(
+            getattr(info, "web_url", None), branch)
+        head += hyperlink(branch_text, url) if use_color else branch_text
+        flags = ("●" if dirty else "") + _ahead_behind_glyphs(ahead, behind)
+        if flags:
+            head += " " + c(soft(theme.s_warn), flags)
+        parts.append(head)
+    if info.is_worktree:
+        name = _worktree_label(info, include_count=False)
+        parts.append(c(soft(theme.wt), f"⑂{name}"))
+    out = " ".join(parts)
+    if duration_text:
+        duration = c(DIM, f"❄ {duration_text}")
+        out += (" · " if out else "") + duration
+    return out
 
 
 def render_identity_line_aurora(info, *, theme: Theme, dirty,
@@ -1011,6 +1019,11 @@ def render(style: str, **kwargs) -> str:
 
     fn = RENDERERS.get(style, render_aurora)
     render_kwargs = dict(kwargs)
+    inline_identity = style == "aurora" and show_pb and info is not None
+    if inline_identity:
+        render_kwargs["identity_text"] = _render_identity_segment_aurora(
+            info, theme=theme, dirty=dirty, ahead=ahead, behind=behind,
+            duration_text=duration_text, use_color=use_color)
     stack = narrow_layout == "stack" and max_width is not None and max_width > 0
 
     def rendered_parts():
@@ -1048,7 +1061,9 @@ def render(style: str, **kwargs) -> str:
             return _stack(parts,
                           _line_separator(fn, theme, render_kwargs.get("density", "regular"),
                                           use_color),
-                          labels, scoped_parts, max_width)
+                          labels, scoped_parts, max_width,
+                          compact_quota=(fn is render_aurora
+                                         and labels == ["5h", "7d"]))
         if stack and visible_width(scoped) > max_width:
             # A separate quota row must not rearrange a fitting first line.
             scoped = '\n'.join(_align_quotas(scoped_parts, max_width))
@@ -1090,7 +1105,7 @@ def render(style: str, **kwargs) -> str:
                 if fits(out):
                     break
 
-    if show_pb and info is not None:
+    if show_pb and info is not None and not inline_identity:
         version_text = _statusbar_version() if show_version else ""
         update_text = _update_hint() if show_version else ""
         identity_fn = (render_identity_line_aurora if style == "aurora"
@@ -1104,7 +1119,7 @@ def render(style: str, **kwargs) -> str:
             lang=ui_lang,
             use_color=use_color,
         )
-    elif cwd_text:
+    elif cwd_text and not inline_identity:
         # show_cwd is on but the identity line is off — give the directory its
         # own minimal line, styled like the identity anchor.
         if use_color:

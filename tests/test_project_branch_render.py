@@ -164,7 +164,7 @@ def test_dispatcher_omits_identity_when_disabled():
     assert "\n" not in out
 
 
-def test_core_no_git_override_hides_only_git_identity(
+def test_core_no_git_override_hides_git_identity(
         tmp_path, monkeypatch, capsys):
     import io
     import json
@@ -207,7 +207,10 @@ def test_core_no_git_override_hides_only_git_identity(
                       _suppress_side_effects=True)
             out = capsys.readouterr().out
             expect_git = show_git and not session_env
-            assert "demo" in out
+            if style == "classic":
+                assert "demo" in out
+            else:
+                assert "demo" not in out
             assert ("topic" in out) is expect_git
             assert ("feature-x" in out) is expect_git
             if not expect_git:
@@ -396,13 +399,12 @@ def test_main_checkout_label_is_worktree_in_every_language():
     info = IdentityInfo(project_name="proj", in_git=True, branch="feature-x",
                         detached=False, worktree_name=None, toplevel="/x",
                         worktree_count=3)
-    for style in ("classic", "aurora"):
-        for lang, label in (("zh", "worktree"), ("en", "worktree")):
-            for color in (False, True):
-                out = render(style, theme=THEME, use_color=color,
-                             show_project_branch=True, identity=info,
-                             ui_lang=lang, msgs_pct=10, weekly_pct=5,
-                             reset_5h="1h", reset_7d="1d", model="Sonnet")
-                assert f"{label} (🌳3)" in out
-                assert "feature-x" in out
-                assert "trunk" not in out
+    for lang, label in (("zh", "worktree"), ("en", "worktree")):
+        for color in (False, True):
+            out = render("classic", theme=THEME, use_color=color,
+                         show_project_branch=True, identity=info,
+                         ui_lang=lang, msgs_pct=10, weekly_pct=5,
+                         reset_5h="1h", reset_7d="1d", model="Sonnet")
+            assert f"{label} (🌳3)" in out
+            assert "feature-x" in out
+            assert "trunk" not in out

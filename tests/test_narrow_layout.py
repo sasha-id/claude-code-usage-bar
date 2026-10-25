@@ -33,22 +33,29 @@ def test_stack_at_70_keeps_every_segment(style, use_color):
     lines = out.split("\n")
     assert all(visible_width(line) <= 70 for line in lines)
     plain = _render(style, 70)
-    for text in ("→100%·1h40m", "→100%·2d15h", "583.0k/1.0M", "12.34",
-                 "EN:6.0↑", "4m23s"):
+    expected = ["583.0k/1.0M", "12.34", "EN:6.0↑"]
+    if style == "classic":
+        expected += ["→100%·1h40m", "→100%·2d15h", "4m23s"]
+    for text in expected:
         assert text in plain
-    # bars lead; the model moved off their row
+    # bars lead; the model never moves ahead of the 7d quota. Aurora's shorter
+    # bars can leave room for the model on that same row.
     rows = plain.split("\n")
     assert rows[0].lstrip().startswith("5h")
-    assert "583.0k" not in rows[0]
-    assert rows.index(next(r for r in rows if "7d" in r)) < rows.index(
+    if style == "classic":
+        assert "583.0k" not in rows[0]
+    assert rows.index(next(r for r in rows if "7d" in r)) <= rows.index(
         next(r for r in rows if "583.0k" in r))
 
 
 @pytest.mark.parametrize("style", list(RENDERERS))
-def test_stack_at_40_fits_and_keeps_model_cost_cache(style):
+def test_stack_at_40_fits_and_keeps_supported_segments(style):
     out = _render(style, 40)
     assert all(visible_width(line) <= 40 for line in out.split("\n"))
-    for text in ("5h", "7d", "583.0k/1.0M", "12.34", "EN:6.0↑", "4m23s"):
+    expected = ["5h", "7d", "583.0k/1.0M", "12.34", "EN:6.0↑"]
+    if style == "classic":
+        expected.append("4m23s")
+    for text in expected:
         assert text in out
     assert "…" not in out  # re-flowed, not clipped
 
@@ -126,7 +133,10 @@ def test_long_language_row_does_not_strip_rows_that_fit(style):
                   projection_5h="→60%", projection_7d="→60%",
                   cost_text="", cache_age_text="",
                   lang_body="ZH:6.0↑ EN:6.0↑ FR:6.0↑ JA:6.0↑")
-    assert out.count("→60%") == 2
+    if style == "classic":
+        assert out.count("→60%") == 2
+    else:
+        assert "→60%" not in out
     assert "583.0k/1.0M" in out
 
 
@@ -161,7 +171,10 @@ def test_model_separator_is_content_not_a_layout_boundary(style, use_color):
 def test_oversized_model_does_not_remove_fitting_quota_projections(style):
     out = _render(style, 40, model="Model" * 15 + "(583.0k/1.0M)",
                   projection_5h="→60%", projection_7d="→60%")
-    assert out.count("→60%") == 2
+    if style == "classic":
+        assert out.count("→60%") == 2
+    else:
+        assert "→60%" not in out
 
 
 @pytest.mark.parametrize("style", list(RENDERERS))
@@ -178,7 +191,10 @@ def test_long_scoped_label_cannot_hide_other_quota_bars(style, use_color):
 @pytest.mark.parametrize("style", list(RENDERERS))
 def test_only_oversized_quota_drops_its_projection(style):
     out = _render(style, 40, projection_5h="→60%", projection_7d="→100%·100d12h")
-    assert "→60%" in out
+    if style == "classic":
+        assert "→60%" in out
+    else:
+        assert "→60%" not in out
     assert "…" not in out
 
 

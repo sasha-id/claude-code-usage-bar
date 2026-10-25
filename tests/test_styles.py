@@ -201,22 +201,13 @@ def test_every_theme_has_pill_cost():
             f"{t.name}.pill_cost must differ from pill_lang (collision is the bug)"
 
 
-def test_aurora_cache_text_drops_seconds_when_far():
-    from claude_statusbar.styles import _aurora_cache_text
-    assert _aurora_cache_text("1h00m00s") == "1h00m"
-    assert _aurora_cache_text("59m12s") == "59m"
-    assert _aurora_cache_text("4m23s") == "4m23s"
-    assert _aurora_cache_text("42s") == "42s"
-    assert _aurora_cache_text("COLD") == "COLD"
-
-
 def test_aurora_plain_layout():
     from claude_statusbar.styles import render
     out = render("aurora", msgs_pct=4, weekly_pct=74, reset_5h="4h16m",
                  reset_7d="2d18h", model="Opus 5.5(70.0k/1.0M)", ctx_pct=7,
                  cache_age_text="59m12s", use_color=False)
-    assert out == ("5h ■■■■■■■■■■■■  4% ⏰4h16m │ 7d ■■■■■■■■■■■■ 74% ⏰2d18h"
-                   " │ Opus 5.5 ■■■■■■ 7% · 70.0k/1.0M │ ❄ 59m")
+    assert out == ("5h ■■■■■■■■  4% 4h16m 7d ■■■■■■■■ 74% 2d18h"
+                   " │ Opus 5.5 70.0k/1.0M")
 
 
 def test_aurora_thin_bar_glyph():
@@ -224,7 +215,7 @@ def test_aurora_thin_bar_glyph():
     out = render("aurora", msgs_pct=4, weekly_pct=74, reset_5h="4h16m",
                  reset_7d="2d18h", model="Opus 5.5", ctx_pct=7,
                  bar_glyph="thin", use_color=False)
-    assert out.startswith("5h ━━━━━━━━━━━━  4% ⏰4h16m │ 7d ━━━━━━━━━━━━ 74%")
+    assert out.startswith("5h ━━━━━━━━  4% 4h16m 7d ━━━━━━━━ 74%")
     assert "■" not in out
 
 
@@ -286,13 +277,9 @@ def test_aurora_identity_worktree_leads():
     assert out.startswith("wt-x (🌳2)")
 
 
-def test_aurora_projection_wins_over_forecast():
+def test_aurora_omits_projection_and_forecast():
     from claude_statusbar.styles import render
     out = render("aurora", msgs_pct=40, weekly_pct=10, reset_5h="2h",
                  reset_7d="3d", model="Opus", projection_5h="→80%",
-                 forecast_5h="~8m", use_color=False)
-    assert "→80%" in out and "~8m" not in out
-    out = render("aurora", msgs_pct=40, weekly_pct=10, reset_5h="2h",
-                 reset_7d="3d", model="Opus", forecast_5h="~8m",
-                 use_color=False)
-    assert "⚠~8m" in out
+                 forecast_5h="~8m", countdown_emoji="⚡", use_color=False)
+    assert "→80%" not in out and "~8m" not in out and "⚡" not in out
