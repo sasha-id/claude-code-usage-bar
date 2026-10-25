@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-statusbar"
-version = "2.7.0"
+version = "3.52.2"
 authors = [
     {name = "leeguooooo", email = "leeguooooo@gmail.com"}
 ]
@@ -33,11 +33,18 @@ dependencies = []
 full = [
     "claude-monitor>=3.0.0",
 ]
+# Desktop floating HUD (macOS only): `cs hud`. Requires PyObjC.
+hud = [
+    "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+]
 
 [project.urls]
 Homepage = "https://github.com/leeguooooo/claude-code-usage-bar"
 Repository = "https://github.com/leeguooooo/claude-code-usage-bar"
 Issues = "https://github.com/leeguooooo/claude-code-usage-bar/issues"
+Changelog = "https://github.com/leeguooooo/claude-code-usage-bar/blob/main/CHANGELOG.md"
+Releases = "https://github.com/leeguooooo/claude-code-usage-bar/releases"
 
 [project.scripts]
 claude-statusbar = "claude_statusbar.cli:main"
@@ -48,4 +55,18 @@ cs = "claude_statusbar.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-claude_statusbar = ["*.py"]
+claude_statusbar = ["*.py", "commands/*.md", "skills/**/*.md"]
+
+[tool.ruff]
+target-version = "py39"
+extend-exclude = ["build", "dist", ".codegraph"]
+
+[tool.ruff.lint]
+# Block undefined names, unused imports/variables and syntax errors first.
+# Styling rules can be added independently without weakening this gate.
+select = ["F", "E9"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]

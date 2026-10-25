@@ -1,6 +1,9 @@
 # macOS
 .DS_Store
 
+# uv lockfile — we publish sdist/wheel to PyPI, no lockfile needed
+uv.lock
+
 # Python cache/bytecode
 __pycache__/
 *.py[cod]
@@ -43,3 +46,9 @@ setup_*.py
 
 # Claude specific
 .claude/
+
+# Agent runtime state
+.omx/
+
+# CodeGraph local index (MCP server)
+.codegraph/

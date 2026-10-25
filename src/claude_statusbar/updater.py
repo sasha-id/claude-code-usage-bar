@@ -2,12 +2,14 @@
 """
 Auto-updater for claude-statusbar
 """
+from __future__ import annotations
 
 import json
 import logging
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -18,6 +20,36 @@ import importlib.metadata as metadata
 # Distribution name on PyPI (used for local version lookup)
 DIST_NAME = "claude-statusbar"
 PYPI_URL = "https://pypi.org/pypi/claude-statusbar/json"
+# One-liner that re-installs the standalone binary from the latest GitHub Release.
+GITHUB_REPO = "leeguooooo/claude-code-usage-bar"
+INSTALL_SH_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/install.sh"
+BINARY_UPGRADE_HINT = f"curl -fsSL {INSTALL_SH_URL} | bash"
+
+
+def _is_frozen() -> bool:
+    """True when running as a PyInstaller standalone binary (no pip/uv around).
+
+    Frozen binaries can't `pip install --upgrade` themselves — `sys.executable`
+    is the binary, not a Python — so the upgrade path re-runs install.sh instead.
+    """
+    return bool(getattr(sys, "frozen", False))
+# The background check writes the latest PyPI version here; the render path
+# reads it (cheap, no network) to show a `↑<newver>` update hint on the bar.
+LATEST_VERSION_CACHE = Path.home() / ".cache" / "claude-statusbar" / "latest_version.json"
+
+
+def _cache_latest_version(version: str) -> None:
+    """Persist the latest-known PyPI version for the render path to read."""
+    try:
+        import time
+        from .cache import atomic_write_text
+        LATEST_VERSION_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(
+            LATEST_VERSION_CACHE,
+            json.dumps({"version": str(version), "checked_at": time.time()}),
+        )
+    except Exception:
+        pass
 
 
 def get_current_version() -> str:
@@ -32,11 +64,64 @@ def get_current_version() -> str:
 def get_latest_version() -> Optional[str]:
     """Get latest version from PyPI"""
     try:
-        with urllib.request.urlopen(PYPI_URL, timeout=5) as response:
+        # Cache-buster: pypi.org/pypi/<pkg>/json sits behind a CDN whose edge
+        # nodes can serve a stale `info.version` for minutes after a release —
+        # long enough for `cs upgrade`, run right after publishing, to report
+        # the version it just replaced. A varying query string misses the edge
+        # cache and asks the origin.
+        import time as _t
+        url = f"{PYPI_URL}?t={int(_t.time())}"
+        with urllib.request.urlopen(url, timeout=5) as response:
             data = json.loads(response.read().decode())
-            return data["info"]["version"]
+            latest = data["info"]["version"]
+            _cache_latest_version(latest)
+            return latest
     except (urllib.error.URLError, json.JSONDecodeError, KeyError):
         return None
+
+
+GITHUB_LATEST_RELEASE_URL = (
+    f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+)
+
+
+def latest_release_tag() -> Optional[str]:
+    """Newest published GitHub Release version, or None.
+
+    The standalone binary is downloaded from GitHub Releases, so GitHub is the
+    authority on whether it is current. Asking PyPI was asking the wrong
+    service: its JSON index updates asynchronously after an upload, so for a
+    minute or two after every release `cs upgrade` answered with the version
+    it had just replaced — five times in one afternoon.
+    """
+    try:
+        req = urllib.request.Request(
+            GITHUB_LATEST_RELEASE_URL,
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": f"claude-statusbar/{get_current_version()}"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            tag = str(json.loads(response.read().decode())["tag_name"])
+        version = tag.lstrip("v") or None
+        if version:
+            # The ↑ hint and `cs doctor` read this cache; binary installs
+            # resolve through here, so skipping it left them on whatever PyPI
+            # said last (doctor: "latest 3.46.1" on 3.49.1).
+            _cache_latest_version(version)
+        return version
+    except (urllib.error.URLError, json.JSONDecodeError, KeyError, TimeoutError):
+        return None
+
+
+def resolve_latest_version() -> Optional[str]:
+    """The newest version available *through this install's own channel*.
+
+    Frozen binaries come from GitHub Releases; everything else from PyPI.
+    Falls back to the other source rather than reporting nothing at all.
+    """
+    if _is_frozen():
+        return latest_release_tag() or get_latest_version()
+    return get_latest_version()
 
 
 def compare_versions(current: str, latest: str) -> bool:
@@ -72,67 +157,688 @@ def detect_install_channel(
     executable: str | Path | None = None,
 ) -> str:
     """Infer how claude-statusbar is currently installed."""
-    resolved = Path(executable or sys.executable).expanduser().resolve()
-    parts = resolved.parts
+    raw = Path(executable or sys.executable).expanduser()
+    candidates = [raw]
+    if executable is None:
+        candidates.append(Path(sys.prefix).expanduser())
+    try:
+        candidates.append(raw.resolve())
+    except OSError:
+        pass
 
-    if "uv" in parts and "tools" in parts and DIST_NAME in parts:
-        return "uv"
+    for path in candidates:
+        parts = path.parts
+        if "uv" in parts and "tools" in parts and DIST_NAME in parts:
+            return "uv"
 
-    if "pipx" in parts and "venvs" in parts and DIST_NAME in parts:
-        return "pipx"
+        if "pipx" in parts and "venvs" in parts and DIST_NAME in parts:
+            return "pipx"
 
     return "pip"
+
+
+# Where uv/pipx actually live when they're not on PATH. The daemon often runs
+# under launchd/systemd, whose PATH is the bare system default — `~/.local/bin`
+# (uv, pipx) and Homebrew are not on it. `shutil.which` alone therefore made
+# the daemon's auto-upgrade fall through to `python -m pip` — and a uv tool
+# venv ships WITHOUT pip, so the upgrade failed silently, forever.
+_TOOL_DIRS = (
+    Path.home() / ".local" / "bin",
+    Path.home() / ".cargo" / "bin",
+    Path("/opt/homebrew/bin"),
+    Path("/usr/local/bin"),
+)
+
+
+def _find_tool(name: str) -> Optional[str]:
+    """Absolute path to `name`, searching PATH first, then well-known dirs."""
+    found = shutil.which(name)
+    if found:
+        return found
+    exe = f"{name}.exe" if sys.platform == "win32" else name
+    for d in _TOOL_DIRS:
+        cand = d / exe
+        if cand.is_file():
+            return str(cand)
+    return None
+
+
+def path_entrypoint() -> Optional[Path]:
+    """Where `cs` on PATH actually lives, fully resolved. None if absent."""
+    found = shutil.which("cs") or shutil.which(DIST_NAME)
+    if not found:
+        return None
+    try:
+        return Path(found).resolve()
+    except OSError:
+        return None
+
+
+def is_shadow_install() -> bool:
+    """True when the `cs` on PATH belongs to a *different* installation.
+
+    Duplicate installs share one entry point: `~/.local/bin/cs`. A leftover
+    `uv tool install claude-statusbar` sitting behind a binary install is
+    harmless right up until it upgrades itself — uv then rewrites that shared
+    symlink to its own copy, and the install the user actually runs is
+    silently replaced. Observed live, twice: a stale uv 3.32.0 auto-upgraded
+    and took the entry point away from the standalone binary.
+
+    So a copy that doesn't own the entry point must never auto-upgrade: it
+    would be upgrading itself *into someone else's install*.
+    """
+    entry = path_entrypoint()
+    if entry is None:
+        return False  # nothing on PATH to shadow
+    # Compare bin DIRECTORIES, resolving the directory rather than the
+    # interpreter file. In a uv-tool / venv install `bin/python3` is a symlink
+    # to the base interpreter (e.g. Homebrew's Cellar), so resolving the file
+    # lands outside the venv and every such install misreads as a shadow —
+    # auto-upgrade then never runs (observed: 3.13.6 stuck for 3 months with
+    # auto_upgrade on). The real shadow case — `cs` on PATH living in a
+    # different install's bin — still differs after this change.
+    try:
+        here = Path(sys.executable).parent.resolve()
+    except OSError:
+        return False
+    if entry.parent == here:
+        return False
+    # Windows: uv copies launchers into its bin dir instead of symlinking, so
+    # the dirs never match and every uv install looked like a shadow — auto-
+    # upgrade never ran there. uv's receipt names the launchers it installed.
+    return not _receipt_owns(entry)
+
+
+def _receipt_owns(entry: Path) -> bool:
+    """Is `entry` a launcher this env's uv-receipt.toml says uv installed?"""
+    import os
+    import re
+    try:
+        text = (Path(sys.prefix) / "uv-receipt.toml").read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return False
+    want = os.path.normcase(str(entry))
+    for raw in re.findall(r'install-path\s*=\s*"([^"]+)"', text):
+        try:
+            if os.path.normcase(str(Path(raw).resolve())) == want:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def find_duplicate_installs() -> list:
+    """Every claude-statusbar installation we can see on this machine.
+
+    They all compete for one `cs` on PATH, so more than one is a latent
+    takeover: the next auto-upgrade of any of them rewrites the shared symlink
+    to itself.
+    """
+    found = []
+    binary_dir = Path.home() / ".local" / "lib" / "claude-statusbar" / "current"
+    if binary_dir.exists():
+        found.append(f"standalone binary ({binary_dir})")
+    uv_dir = Path.home() / ".local" / "share" / "uv" / "tools" / DIST_NAME
+    if uv_dir.is_dir():
+        found.append(f"uv tool ({uv_dir})")
+    pipx_dir = Path.home() / ".local" / "pipx" / "venvs" / DIST_NAME
+    if pipx_dir.is_dir():
+        found.append(f"pipx ({pipx_dir})")
+    return found
 
 
 def get_upgrade_command(
     executable: str | Path | None = None,
 ) -> list[str]:
     """Return the most appropriate self-upgrade command for this install."""
+    if _is_frozen():
+        # Standalone binary: re-run the installer, which pulls the latest
+        # release binary for this platform.
+        return ["sh", "-c", BINARY_UPGRADE_HINT]
+
     channel = detect_install_channel(executable)
 
-    if channel == "uv" and shutil.which("uv"):
-        return ["uv", "tool", "install", "--upgrade", DIST_NAME]
+    if channel == "uv":
+        uv = _find_tool("uv")
+        if uv:
+            if sys.platform == "win32":
+                # `tool install --upgrade` rebuilds the env and dies deleting
+                # the in-use Scripts\\, half-removed; `tool upgrade` syncs it
+                # in place. See _run_windows_uv_upgrade. `tool upgrade` has
+                # NO --refresh-package (uv 0.12: "unexpected argument"; the
+                # only match in its --help is --reinstall-package's blurb) —
+                # 3.43.8/3.43.9 shipped it and every Windows upgrade failed.
+                return [uv, "tool", "upgrade", DIST_NAME]
+            # uv's cached index can lag a release; refresh just this package.
+            return [uv, "tool", "install", "--upgrade",
+                    "--refresh-package", DIST_NAME, DIST_NAME]
 
-    if channel == "pipx" and shutil.which("pipx"):
-        return ["pipx", "upgrade", DIST_NAME]
+    if channel == "pipx":
+        pipx = _find_tool("pipx")
+        if pipx:
+            return [pipx, "upgrade", DIST_NAME]
 
     return [sys.executable, "-m", "pip", "install", "--upgrade", DIST_NAME]
 
 
-def auto_upgrade() -> bool:
-    """Attempt automatic upgrade"""
+# Hard cap so a hung pip/uv install can NEVER freeze a Claude Code statusLine
+# render. 60s is generous for fast networks and short-circuits cleanly on slow
+# ones — the user gets a normal status line at the next session.
+_UPGRADE_TIMEOUT_S = 60
+
+
+def _run_upgrade(cmd) -> bool:
+    """Run an upgrade command with a timeout. Returns True on success.
+
+    Output is captured as bytes and never decoded on the way in (#66). With
+    ``text=True`` Python decodes in the locale codec — GBK on Chinese
+    Windows — and uv's UTF-8 output killed the reader thread with a
+    UnicodeDecodeError. The exception then made ``subprocess.run`` kill uv
+    mid-install, leaving a tool env whose entry point had no package.
+    """
+    if _is_windows_uv_upgrade(cmd):
+        return _run_windows_uv_upgrade(cmd)
+    return _run_upgrade_command(cmd)
+
+
+# The tail of the last failed upgrade command's stderr, so `cs upgrade` can
+# show what the installer said instead of "run it by hand to see why".
+_last_upgrade_error = ""
+
+
+def _run_upgrade_command(cmd, log_failure: bool = True) -> bool:
+    import os
+    global _last_upgrade_error
+    _last_upgrade_error = ""
+    env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     try:
         result = subprocess.run(
-            get_upgrade_command(),
+            cmd,
             capture_output=True,
-            text=True,
+            timeout=_UPGRADE_TIMEOUT_S,
+            env=env,
         )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError,
+            ValueError) as e:
+        _last_upgrade_error = str(e)
+        logging.error(f"Upgrade command {cmd!r} failed: {e}")
+        return False
+    if result.returncode != 0:
+        err = (result.stderr or b"").decode("utf-8", "replace").strip()
+        _last_upgrade_error = err[-500:]
+        if log_failure:
+            logging.error(f"Upgrade command {cmd!r} exited "
+                          f"{result.returncode}: {err[-500:]}")
+    return result.returncode == 0
 
-        if result.returncode == 0:
-            return True
 
-        # Fallback to pipx when the preferred path fails and pipx is available
-        try:
-            result = subprocess.run(
-                ["pipx", "upgrade", "claude-statusbar"], capture_output=True, text=True
-            )
-            if result.returncode == 0:
-                return True
-        except FileNotFoundError:
-            pass
+def _entrypoint_healthy() -> Optional[bool]:
+    """Does `cs --version` on PATH still run? None when it can't be asked.
 
-        # Final fallback: plain pip in the current interpreter
+    A failed upgrade can leave the entry point behind with its package gone
+    (#66) — every `cs` then dies with ModuleNotFoundError and the status line
+    vanishes. The exit code is the tell: ``installed_version_on_path`` can't
+    be used here, it would read the traceback's last word as a version.
+    """
+    entry = path_entrypoint()
+    if entry is None:
+        return None
+    try:
+        out = subprocess.run([str(entry), "--version"], capture_output=True,
+                             timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return out.returncode == 0
+
+
+def _upgrade_with_repair(cmd) -> Tuple[bool, bool]:
+    """Run `cmd`; if it failed AND broke our install, run it once more.
+
+    Returns (succeeded, left_broken). Only checks the entry point when it is
+    ours — a shadow install's `cs` belongs to someone else's install, and
+    re-running our command can't fix it.
+    """
+    if _run_upgrade(cmd):
+        return True, False
+    if is_shadow_install() or _entrypoint_healthy() is not False:
+        return False, False
+    logging.error("upgrade failed and left `cs` unrunnable; retrying once")
+    if _run_upgrade(cmd) and _entrypoint_healthy() is not False:
+        return True, False
+    return False, _entrypoint_healthy() is False
+
+
+# The installer downloads a ~10-25 MB release asset; the 60s cap that suits a
+# pip/uv upgrade is too tight for it on a slow link.
+_INSTALLER_TIMEOUT_S = 600
+
+
+def _run_installer(version: Optional[str] = None) -> bool:
+    """Run install.sh, letting its output through so the user watches it work.
+
+    Pins the download to `version`'s own tag rather than trusting
+    `releases/latest/download`: that pointer lags for a while after a release,
+    and the installer never checks that what it fetched is what was asked for.
+    Observed: an upgrade to 3.35.3 quietly re-installed 3.35.2 and reported
+    success. The installer already honors CS_RELEASE_BASE_URL.
+
+    Only ever called from an explicit `cs upgrade` — never unattended.
+    """
+    import os
+    env = dict(os.environ)
+    if _is_frozen():
+        # The installer prunes old bundle dirs, and during an unattended
+        # upgrade *this* process is executing out of one of them. A PyInstaller
+        # onedir binary dlopens its libraries lazily, so deleting that dir
+        # mid-run can kill the upgrade it is performing. Tell the installer to
+        # spare it; the next upgrade prunes it once nothing is inside.
+        env["CS_KEEP_BUNDLE_DIR"] = str(Path(sys.executable).resolve().parent)
+    if version:
+        env["CS_RELEASE_BASE_URL"] = (
+            f"https://github.com/{GITHUB_REPO}/releases/download/v{version}"
+        )
+    try:
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", DIST_NAME],
-            capture_output=True,
-            text=True,
+            ["sh", "-c", BINARY_UPGRADE_HINT],
+            timeout=_INSTALLER_TIMEOUT_S,
+            env=env,
         )
         return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        logging.error(f"binary installer failed: {e}")
+        return False
 
-    except Exception as e:
-        logging.error(f"Upgrade failed: {e}")
 
-    return False
+UPGRADE_STATUS = Path.home() / ".cache" / "claude-statusbar" / "upgrade_status.json"
+_RESTART_WAIT_S = 6.0
+_RESTART_RETRIES = 2
+
+
+def _daemon_alive() -> bool:
+    from .daemon import read_pidfile, is_alive
+    pid = read_pidfile()
+    return bool(pid) and is_alive(pid)
+
+
+def _daemon_started_since(t0: float) -> bool:
+    """A live daemon whose pidfile was written after t0 — i.e. one started by
+    (or after) the install, so it runs the new code."""
+    from .daemon import pid_path
+    try:
+        return _daemon_alive() and pid_path().stat().st_mtime >= t0 - 1
+    except OSError:
+        return False
+
+
+def _wait_daemon(t0: float, timeout: float) -> bool:
+    deadline = time.time() + timeout
+    while True:
+        if _daemon_started_since(t0):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
+def _restart_daemon_only() -> Tuple[bool, str]:
+    """Retry just the restart: the service manager when one supervises the
+    daemon, otherwise a detached `cs daemon start` from the new binary."""
+    from . import service
+    if service.is_installed():
+        return service.restart()
+    entry = path_entrypoint()
+    cmd = [str(entry) if entry else "cs", "daemon", "start"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, f"`cs daemon start` failed: {e}"
+    if r.returncode != 0:
+        return False, (r.stderr or r.stdout or "").strip()[-200:] or "`cs daemon start` failed"
+    return True, "daemon started"
+
+
+def settle_daemon(t0: float, needed: bool) -> Tuple[str, str]:
+    """After an install that landed: confirm the daemon came back on the new
+    code, retrying only the restart. → (state, detail) with state one of
+    restarted | not_running | restart_failed; recorded for `cs doctor`."""
+    if not needed:
+        state, detail = "not_running", ""
+    elif _wait_daemon(t0, _RESTART_WAIT_S):
+        state, detail = "restarted", ""
+    else:
+        state, detail = "restart_failed", "daemon did not come back after the install"
+        for attempt in range(1, _RESTART_RETRIES + 1):
+            ok, msg = _restart_daemon_only()
+            if _wait_daemon(t0, _RESTART_WAIT_S):
+                state, detail = "restarted", f"after {attempt} restart retr{'y' if attempt == 1 else 'ies'}"
+                break
+            detail = msg if not ok else "restart reported ok but no new daemon appeared"
+    try:
+        from .cache import atomic_write_text
+        atomic_write_text(UPGRADE_STATUS, json.dumps({
+            "version": installed_version_on_path() or "", "ts": time.time(),
+            "daemon": state, "detail": detail}))
+    except Exception:
+        pass
+    return state, detail
+
+
+def restart_hint() -> str:
+    from . import service
+    return "cs daemon install" if service.is_installed() else "cs daemon start"
+
+
+def installed_version_on_path() -> Optional[str]:
+    """The version of the `cs` that PATH resolves to, by asking it.
+
+    The running process can't report this after an upgrade — it is still the
+    old binary in memory. Asking the installed one is the only way to know
+    what actually landed.
+    """
+    entry = path_entrypoint()
+    if entry is None:
+        return None
+    try:
+        out = subprocess.run([str(entry), "--version"], capture_output=True,
+                             text=True, encoding="utf-8",
+                             errors="replace", timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    parts = (out.stdout or out.stderr).strip().split()
+    return parts[-1] if parts else None
+
+
+# Console-script names from pyproject's [project.scripts].
+_ENTRY_EXES = ("cs.exe", "cstatus.exe", "claude-statusbar.exe")
+
+
+def _is_windows_uv_upgrade(cmd) -> bool:
+    return sys.platform == "win32" and list(cmd[1:3]) == ["tool", "upgrade"]
+
+
+def _run_windows_uv_upgrade(cmd) -> bool:
+    """`uv tool upgrade` with the in-use launchers moved out of its way.
+
+    Windows won't delete or overwrite a file a process has open, and while
+    Claude Code is open `cs.exe` always is: the daemon and every statusLine
+    render run it. uv then fails copying the new launcher over it (os error
+    32). A running exe CAN be renamed, so move the launchers aside first and
+    let uv write fresh ones. Verified on Windows 11 with the daemon, the
+    upgrading process and a render loop all holding files: exit 0, and `cs`
+    kept working throughout.
+
+    Any launcher uv didn't rewrite — it failed, or found nothing to upgrade —
+    is moved back, so this can never leave `cs` missing. Leftover `.old-*`
+    files are still locked by their processes; the next upgrade deletes them.
+
+    Success is judged by the installed version, not uv's exit code. A render
+    can run the new launcher the instant uv creates it, and uv then fails the
+    copy (os error 32) *after* the env is already upgraded in place. The
+    launcher is a generic trampoline, so the restored old one runs the new
+    package. Observed on Windows 11 with renders every 50ms.
+    """
+    import time
+    entry = path_entrypoint()
+    bindir = entry.parent if entry is not None else None
+    moved = []
+    if bindir is not None:
+        for stale in bindir.glob("*.exe.old-*"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass  # its process is still running; next time
+        stamp = time.time_ns()
+        for name in _ENTRY_EXES:
+            live = bindir / name
+            if not live.is_file():
+                continue
+            aside = bindir / f"{name}.old-{stamp}"
+            try:
+                live.rename(aside)
+            except OSError:
+                continue  # uv reports it if it still can't write this one
+            moved.append((live, aside))
+    before = get_current_version()
+    try:
+        ok = _run_upgrade_command(cmd, log_failure=False)
+    finally:
+        _restore_launchers(moved)
+    if not ok and get_current_version() != before:
+        logging.info("uv exited nonzero but the package was upgraded")
+        return True
+    if not ok:
+        logging.error(f"Upgrade command {cmd!r} failed: "
+                      f"{_last_upgrade_error}")
+    return ok
+
+
+def _restore_launchers(moved) -> None:
+    for live, aside in moved:
+        if live.exists():
+            try:
+                aside.unlink()  # uv wrote a new one; the old is free unless running
+            except OSError:
+                pass  # still running — the next upgrade clears it
+            continue
+        try:
+            aside.rename(live)
+        except OSError as e:
+            logging.error(f"could not restore {live}: {e}")
+
+
+def _windows_in_place() -> bool:
+    """A pip/pipx install on Windows, which can't safely upgrade itself.
+
+    The upgrade runs from the env's own python.exe and the daemon and every
+    statusLine render hold its files; nothing has verified pip or pipx cope,
+    and a half-done upgrade removes the status line. uv installs (the Windows
+    installer's) go through _run_windows_uv_upgrade instead.
+    """
+    return (sys.platform == "win32" and not _is_frozen()
+            and not _is_windows_uv_upgrade(get_upgrade_command()))
+
+
+def _windows_upgrade_steps(cmd) -> str:
+    return (
+        "Windows can't upgrade a running pip/pipx install of cs in place, "
+        "so cs won't upgrade itself here. To upgrade:\n"
+        "  1. Quit every Claude Code session (each one keeps running cs.exe).\n"
+        "  2. In a new terminal: cs daemon stop\n"
+        f"  3. {' '.join(cmd)}\n"
+        "  4. cs --version"
+    )
+
+
+def auto_upgrade() -> bool:
+    """Attempt automatic upgrade. Bounded by _UPGRADE_TIMEOUT_S per attempt."""
+    if is_shadow_install():
+        # Upgrading would relink the shared `cs` entry point to this copy,
+        # replacing whatever install the user actually uses. Never behind
+        # their back; an explicit `cs upgrade` still works.
+        logging.info("skipping auto-upgrade: not the install that owns `cs`")
+        return False
+
+    if _windows_in_place():
+        # Unattended, a half-done pip/pipx upgrade would take the status line
+        # with it. The ↑newver hint still shows; `cs upgrade` prints the steps.
+        logging.info("skipping auto-upgrade: Windows can't upgrade in place")
+        return False
+
+    if _is_frozen():
+        # Binary installs auto-upgrade too (opt out with
+        # CLAUDE_STATUSBAR_NO_UPDATE=1 or `cs config set auto_upgrade false`).
+        # The installer is pinned to the version we resolved and the result is
+        # verified, so an unattended run can't quietly leave a different build
+        # behind — the failure mode that made this path suspect to begin with.
+        latest = resolve_latest_version()
+        if latest is None or not compare_versions(get_current_version(), latest):
+            return False
+        had_daemon, t0 = _daemon_alive(), time.time()
+        if not _run_installer(latest):
+            return False
+        if installed_version_on_path() != latest:
+            return False
+        # Installed is installed: a failed restart is retried on its own and
+        # never triggers another download.
+        state, detail = settle_daemon(t0, had_daemon)
+        if state == "restart_failed":
+            logging.error(f"upgraded to {latest} but daemon restart failed: {detail}")
+        return True
+
+    ok, broken = _upgrade_with_repair(get_upgrade_command())
+    if ok:
+        return True
+    if broken or sys.platform == "win32":
+        # Broken: the status line is already gone, and a pip install into a
+        # different environment won't bring it back. Windows: the fallbacks
+        # below would upgrade in place, which only the uv path handles.
+        return False
+
+    pipx = _find_tool("pipx")
+    if pipx:
+        if _run_upgrade([pipx, "upgrade", DIST_NAME]):
+            return True
+
+    return _run_upgrade(
+        [sys.executable, "-m", "pip", "install", "--upgrade", DIST_NAME]
+    )
+
+
+def _installer_said() -> str:
+    """The last lines of the failed installer's stderr, ready to append."""
+    lines = [ln for ln in _last_upgrade_error.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    return "\nThe installer said:\n" + "\n".join(f"  {ln}" for ln in lines[-6:])
+
+
+def _not_visible_yet(current: str, latest: str) -> str:
+    return (
+        f"PyPI lists v{latest}, but the installer doesn't see it yet "
+        f"(package index caches lag a release by up to a minute). Still on "
+        f"v{current} — run `cs upgrade` again in a minute."
+    )
+
+
+def upgrade_current_install() -> Tuple[bool, str]:
+    """Upgrade the environment that is actually running this CLI."""
+    current = get_current_version()
+
+    if _is_frozen():
+        latest = resolve_latest_version()
+        if latest is None:
+            # A check that never completed is not "up to date" — saying so
+            # hides exactly the case the user ran this command to find out.
+            return False, (
+                f"Standalone binary v{current} — could not reach GitHub or "
+                f"PyPI to check for updates (network or TLS failure).\n"
+                f"Update manually with:\n  {BINARY_UPGRADE_HINT}"
+            )
+        if not compare_versions(current, latest):
+            return True, (
+                f"Standalone binary v{current} is the latest "
+                f"(per GitHub Releases)."
+            )
+
+        # Do the upgrade. Running the installer is what `cs upgrade` means;
+        # printing the command and calling it a day was a command that named
+        # an action it didn't perform. `auto_upgrade` still refuses to touch a
+        # frozen install — that one runs unattended, and *that* is the case
+        # "never pipe curl|sh behind the user's back" was written for.
+        print(f"Upgrading the standalone binary v{current} → v{latest}...")
+        had_daemon, t0 = _daemon_alive(), time.time()
+        if not _run_installer(latest):
+            return False, (
+                f"Upgrade to v{latest} failed. Run it manually to see why:\n"
+                f"  {BINARY_UPGRADE_HINT}"
+            )
+        # Verify rather than announce. The installer exiting 0 only means it
+        # installed *something* — it once installed the version we were
+        # upgrading away from, and this line claimed success anyway.
+        landed = installed_version_on_path()
+        if landed is None:
+            return True, (
+                f"Ran the installer for v{latest}, but could not read the "
+                f"installed version back. Check `cs --version`."
+            )
+        if landed != latest:
+            return False, (
+                f"Asked for v{latest} but v{landed} is what installed. "
+                f"The release assets may still be publishing — try again in "
+                f"a minute."
+            )
+        state, detail = settle_daemon(t0, had_daemon)
+        if state == "restart_failed":
+            return False, (
+                f"Installed v{landed}, but the background daemon did not restart "
+                f"({detail}). Retried the restart {_RESTART_RETRIES}× without "
+                f"reinstalling. The status line still renders meanwhile.\n"
+                f"Retry the restart with:  {restart_hint()}"
+            )
+        note = " Daemon restarted on the new version." if state == "restarted" else ""
+        return True, (
+            # Claude Code spawns `cs render` fresh every statusline tick, so
+            # the replaced binary is live within ~1s.
+            f"Upgraded the standalone binary to v{landed}. "
+            f"Live on the next statusline tick — no restart needed.{note}"
+        )
+
+    cmd = get_upgrade_command()
+
+    if _windows_in_place():
+        return False, _windows_upgrade_steps(cmd)
+
+    ok, broken = _upgrade_with_repair(cmd)
+    if ok:
+        refreshed = get_current_version()
+        if refreshed == current:
+            # The installer can miss a release PyPI's JSON API already shows:
+            # its index is served from a CDN edge that lags for up to a minute
+            # (seen on Windows, 3.43.8 — even with --refresh-package). Saying
+            # "latest" then is wrong; say what's true and when to retry.
+            latest = resolve_latest_version()
+            if latest and compare_versions(current, latest):
+                return False, _not_visible_yet(current, latest)
+            return True, f"{DIST_NAME} v{current} is already the latest."
+        return True, f"Upgraded {DIST_NAME} from v{current} to v{refreshed}"
+
+    rendered_cmd = " ".join(cmd)
+    if broken:
+        return False, (
+            f"Upgrade failed and left the install broken — `cs` no longer "
+            f"runs, so the status line is gone.\n"
+            f"Repair it with:\n  {rendered_cmd}{_installer_said()}"
+        )
+    said = _installer_said()
+    return False, f"Upgrade failed. Run manually: {rendered_cmd}{said}"
+
+
+def spawn_background_upgrade_check() -> None:
+    """Fire-and-forget: run the version check + upgrade in a DETACHED
+    subprocess (`python -m claude_statusbar.updater`) so it never blocks a
+    status-line render — the upgrade itself can take tens of seconds. The
+    detached process re-checks the 6h marker is irrelevant here (the caller
+    already gated on it); it just performs the check_and_upgrade once.
+
+    Best-effort: any spawn failure is swallowed so a render is never harmed.
+    On a successful upgrade the on-disk package mtime changes, and the daemon's
+    code-drift detection (render_thin._is_fresh) restarts it onto new code.
+    """
+    if is_shadow_install():
+        # A duplicate install must not upgrade itself into an entry point
+        # another install owns. See is_shadow_install.
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "claude_statusbar.updater"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except (OSError, ValueError):
+        pass
 
 
 def spawn_update_check_background() -> None:
@@ -156,22 +862,32 @@ def spawn_update_check_background() -> None:
 
 def check_and_upgrade() -> Tuple[bool, str]:
     """Check for updates and upgrade if available"""
-    latest = get_latest_version()
+    latest = resolve_latest_version()
     current = get_current_version()
 
     if not latest:
         return False, "Unable to check for updates"
 
+    _cache_latest_version(latest)
+
     if not compare_versions(current, latest):
-        return False, f"Already up to date (v{current})"
+        # Nothing to do is a success. Reporting it as a failure means the
+        # detached checker exits 1 on every ordinary day.
+        return True, f"Already up to date (v{current})"
 
     # New version available, try to upgrade
     if auto_upgrade():
+        if not _is_frozen() and get_current_version() == current:
+            # The installer exited 0 without upgrading: it hasn't seen the
+            # release yet. (A frozen upgrade is already verified against
+            # the installed binary; this process's metadata is the old one.)
+            return False, _not_visible_yet(current, latest)
         return True, f"Upgraded from v{current} to v{latest}"
     else:
         return (
             False,
-            f"Update available (v{latest}) but auto-upgrade failed. Run: pip install --upgrade claude-statusbar",
+            f"Update available (v{latest}) but auto-upgrade failed. "
+            f"Run `cs upgrade` to see why.",
         )
 
 

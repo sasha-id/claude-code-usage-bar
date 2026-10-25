@@ -1,0 +1,238 @@
+name: Release binaries
+
+# Builds the standalone onedir `cs` bundle for each platform and attaches it to
+# the GitHub Release, so users can `curl … install.sh | bash` with no Python/pip.
+#
+# Fires when a Release is published (the existing per-tag release flow), can be
+# run manually against an existing tag via the Actions tab, and is called by
+# release.yml — a release created with GITHUB_TOKEN does not fire
+# `release: published`, so the automated flow has to call this workflow
+# directly rather than wait for an event that never arrives.
+
+on:
+  release:
+    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: "Existing tag to build + upload assets for (e.g. v3.29.12)"
+        required: true
+        type: string
+      stage_only:
+        description: "Stage artifacts for the parent workflow to publish after validation"
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build + upload assets for (e.g. v3.29.12)"
+        required: true
+        type: string
+      stage_only:
+        description: "Stage artifacts for the parent workflow to publish after validation"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: release-binaries-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Publishing a fully-built draft should not rebuild/replace live assets.
+    # `inputs.tag` is set for workflow_dispatch and workflow_call alike, and
+    # empty on the release event — github.event_name would say `push` here when
+    # release.yml calls us, since a called workflow reports the CALLER's event.
+    if: >-
+      inputs.tag != '' ||
+      !contains(github.event.release.assets.*.name, 'cs-darwin-arm64.tar.gz') ||
+      !contains(github.event.release.assets.*.name, 'cs-darwin-arm64.tar.gz.sha256') ||
+      !contains(github.event.release.assets.*.name, 'cs-linux-x86_64.tar.gz') ||
+      !contains(github.event.release.assets.*.name, 'cs-linux-x86_64.tar.gz.sha256')
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14        # Apple Silicon
+            asset: cs-darwin-arm64.tar.gz
+            extra_assets: cs-darwin-arm64.dmg*
+          - os: ubuntu-22.04    # glibc 2.35 — broad compat
+            asset: cs-linux-x86_64.tar.gz
+            extra_assets: ""
+        # Intel macOS (macos-13) is intentionally omitted: GitHub-hosted Intel
+        # runners can queue for hours or never get assigned on this account.
+        # Intel-Mac users fall through install.sh to the pip installer, which
+        # works fine. Re-add `{os: macos-13, asset: cs-darwin-x86_64.tar.gz}`
+        # here if a reliable Intel runner becomes available.
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - name: Check existing platform assets
+        id: assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          if ! gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > release-assets.json 2> lookup-error.txt; then
+            if ! grep -q 'HTTP 404' lookup-error.txt; then
+              cat lookup-error.txt >&2
+              exit 1
+            fi
+            echo '{"assets":[]}' > release-assets.json
+          fi
+          python - <<'PYCODE'
+          import json, os
+          assets = json.load(open('release-assets.json'))['assets']
+          names = {a['name'] for a in assets if a.get('state') == 'uploaded' and a.get('size', 0) > 0}
+          asset = os.environ['ASSET']
+          complete = asset in names and asset + '.sha256' in names
+          version = tuple(map(int, os.environ['TAG'].lstrip('v').split('.')))
+          if asset.startswith('cs-darwin') and version >= (3, 46, 0):
+              complete = complete and {'cs-darwin-arm64.dmg', 'cs-darwin-arm64.dmg.sha256'} <= names
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('complete=' + str(complete).lower() + '\n')
+          PYCODE
+
+      - uses: actions/setup-python@v5
+        if: steps.assets.outputs.complete != 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Install package + PyInstaller
+        if: steps.assets.outputs.complete != 'true'
+        # The [hud] extra pulls in PyObjC — its `sys_platform == 'darwin'`
+        # markers mean it installs on the macOS runner (so the spec can bundle
+        # the desktop HUD) and is skipped on Linux automatically.
+        run: |
+          python -m pip install --upgrade pip
+          pip install '.[hud]' pyinstaller certifi
+
+      - name: Build binary
+        if: steps.assets.outputs.complete != 'true'
+        run: pyinstaller packaging/cs.spec --noconfirm
+
+      - uses: actions/setup-go@v5
+        if: steps.assets.outputs.complete != 'true'
+        with:
+          go-version: '1.23.x'
+          cache: false
+
+      - name: Build native statusline entrypoint
+        if: steps.assets.outputs.complete != 'true'
+        run: |
+          mv dist/cs/cs dist/cs/cs-python
+          go build -trimpath -ldflags='-s -w' -o dist/cs/cs packaging/native/main.go
+
+      - uses: actions/checkout@v4
+        if: steps.assets.outputs.complete != 'true' && runner.os == 'macOS'
+        with:
+          ref: ${{ github.sha }}
+          path: release-tools
+
+      - name: Import temporary macOS signing credentials
+        if: steps.assets.outputs.complete != 'true' && runner.os == 'macOS'
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: bash release-tools/scripts/macos_ci_keychain.sh prepare
+
+      - name: Sign and notarize macOS distribution
+        if: steps.assets.outputs.complete != 'true' && runner.os == 'macOS'
+        env:
+          SIGNING_IDENTITY: Developer ID Application
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: python release-tools/scripts/sign_macos.py dist/cs --output .
+
+      - name: Smoke-test the binary
+        if: steps.assets.outputs.complete != 'true'
+        run: |
+          ./dist/cs/cs --version
+          ./dist/cs/cs styles >/dev/null
+          # Exercise the `-m` self-spawn shim the daemon relies on.
+          ./dist/cs/cs -m claude_statusbar._ip_risk_refresh || true
+          # The hot-path binary must be onedir. A onefile regression would
+          # recreate the disk leak fixed after v3.32.3.
+          test -d ./dist/cs/_internal
+          python scripts/benchmark_native.py ./dist/cs/cs
+          python scripts/benchmark_daemon.py ./dist/cs/cs
+          python scripts/benchmark_daemon.py ./dist/cs/cs --mode official
+          # macOS: verify the HUD (pyobjc) actually got bundled — non-GUI check.
+          if [ "$RUNNER_OS" = "macOS" ]; then ./dist/cs/cs hud check; fi
+
+      - name: Package (tar.gz + sha256)
+        if: steps.assets.outputs.complete != 'true'
+        run: |
+          tar -czf "${{ matrix.asset }}" -C dist cs
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
+          ls -lh "${{ matrix.asset }}"*
+
+      - name: Stage validated platform bundle
+        if: steps.assets.outputs.complete != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+            ${{ matrix.extra_assets }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove temporary signing credentials
+        if: always() && runner.os == 'macOS' && steps.assets.outputs.complete != 'true'
+        run: bash release-tools/scripts/macos_ci_keychain.sh cleanup
+
+  publish:
+    name: Publish validated binaries
+    permissions:
+      contents: write
+      actions: read
+    needs: build
+    if: inputs.stage_only != true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cs-*.tar.gz
+          path: new-assets
+          merge-multiple: true
+      - name: Verify all platform bundles
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          mkdir -p release-assets
+          if compgen -G "new-assets/*" >/dev/null; then cp new-assets/* release-assets/; fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            mkdir -p existing-assets
+            gh release download "$TAG" --dir existing-assets --pattern 'cs-*'
+            cp -n existing-assets/* release-assets/
+          fi
+          python scripts/verify_release_assets.py --directory release-assets --version "${TAG#v}"
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name || inputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            new-assets/cs-*.tar.gz
+            new-assets/cs-*.tar.gz.sha256
+            new-assets/cs-*.dmg
+            new-assets/cs-*.dmg.sha256

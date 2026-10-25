@@ -1,311 +1,457 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# claude-statusbar — standalone binary installer (no Python, no pip required).
+#
+# Usage (read the script first, please):
+#   curl -fsSL https://raw.githubusercontent.com/leeguooooo/claude-code-usage-bar/main/install.sh -o /tmp/cs.sh
+#   less /tmp/cs.sh        # audit it
+#   bash /tmp/cs.sh
+#
+# Or, if you trust this repo:
+#   curl -fsSL https://raw.githubusercontent.com/leeguooooo/claude-code-usage-bar/main/install.sh | bash
+#
+# What it does (full disclosure):
+#   1. Detects your OS + CPU arch and downloads the matching prebuilt `cs`
+#      bundle from the latest GitHub Release (self-contained — no Python
+#      needed on your machine). The installed bundle uses PyInstaller onedir,
+#      not onefile, so the once-per-second status render never extracts `_MEI*`
+#      runtime copies into your temp directory.
+#   2. Verifies the SHA-256 checksum published alongside it.
+#   3. Installs it to ~/.local/bin (no sudo; everything under $HOME) and, with
+#      your [y/N] consent, adds ~/.local/bin to PATH in your shell rc.
+#   4. Runs `cs --setup` to wire the Claude Code statusLine + slash commands.
+#   5. Removes inactive `_MEI*` directories leaked by legacy onefile versions,
+#      after stopping the old daemon and verifying no process has them open.
+#   6. On macOS, if the Claude desktop app is installed, also registers the
+#      floating desktop HUD to auto-start on login (`cs hud install`) — the
+#      macOS binary bundles the HUD, so this needs no Python. One command wires
+#      up both the terminal statusLine and the desktop panel.
+#
+#   If no prebuilt binary matches your platform (e.g. Linux arm64, Windows), it
+#   automatically falls back to the pip/uv-based installer (web-install.sh),
+#   which needs Python 3.9+.
+#
+# No sudo. No telemetry. The only remote hosts touched are github.com (release
+# assets) and, only on fallback, PyPI / astral.sh (uv).
 
-# Claude Status Bar Monitor - Installation Script
-# This script handles all installation scenarios
+set -euo pipefail
 
-set -e  # Exit on error
+REPO="leeguooooo/claude-code-usage-bar"
+INSTALL_DIR="${CS_INSTALL_DIR:-$HOME/.local/bin}"
+BUNDLE_ROOT="${CS_BUNDLE_ROOT:-$HOME/.local/lib/claude-statusbar}"
+FALLBACK_URL="https://raw.githubusercontent.com/${REPO}/main/web-install.sh"
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-# Script directory
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-SCRIPT_PATH="$SCRIPT_DIR/statusbar.py"
-
-echo -e "${BLUE}==================================${NC}"
-echo -e "${BLUE}Claude Status Bar Monitor Installer${NC}"
-echo -e "${BLUE}==================================${NC}\n"
-
-# Function to print colored messages
-print_success() {
-    echo -e "${GREEN}✅ $1${NC}"
+# A pip/uv/pipx copy of claude-statusbar competes with this binary for the one
+# `cs` on PATH: whichever upgrades last rewrites the symlink and silently takes
+# over. We don't remove another package manager's package behind the user's
+# back, but staying quiet about it is how a stale uv 3.32.0 replaced a working
+# binary install without anyone noticing.
+warn_about_duplicate_installs() {
+    local found=""
+    [ -d "$HOME/.local/share/uv/tools/claude-statusbar" ] && found="uv tool"
+    [ -d "$HOME/.local/pipx/venvs/claude-statusbar" ] && found="${found:+$found and }pipx"
+    [ -n "$found" ] || return 0
+    warn "Another claude-statusbar install ($found) is also present."
+    echo "     Both compete for $INSTALL_DIR/cs — whichever upgrades last wins."
+    echo "     Remove the other one so upgrades stay predictable:"
+    [ -d "$HOME/.local/share/uv/tools/claude-statusbar" ] && \
+        echo "       uv tool uninstall claude-statusbar"
+    [ -d "$HOME/.local/pipx/venvs/claude-statusbar" ] && \
+        echo "       pipx uninstall claude-statusbar"
 }
 
-print_error() {
-    echo -e "${RED}❌ $1${NC}"
+# Scratch dir for the downloaded tarball, cleaned up on any exit. Declared here
+# (not inside the function that fills it) so the trap can still see it — see the
+# note at the mktemp call.
+TMP_DIR=""
+INSTALL_STAGE=""
+INSTALLED_BUNDLE_DIR=""
+DMG_MOUNT=""
+cleanup() {
+    if [ -n "${DMG_MOUNT:-}" ]; then
+        hdiutil detach "$DMG_MOUNT" -quiet || hdiutil detach "$DMG_MOUNT" -force -quiet || return 0
+    fi
+    [ -n "${TMP_DIR:-}" ] && rm -rf "$TMP_DIR"
+    [ -n "${INSTALL_STAGE:-}" ] && rm -rf "$INSTALL_STAGE"
+    return 0
+}
+trap cleanup EXIT
+
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; RED='\033[0;31m'; NC='\033[0m'
+
+say()  { echo -e "${BLUE}$*${NC}"; }
+ok()   { echo -e "${GREEN}$*${NC}"; }
+warn() { echo -e "${YELLOW}$*${NC}"; }
+err()  { echo -e "${RED}$*${NC}" >&2; }
+
+echo -e "${BLUE}╔══════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║   Claude Status Bar — binary install ║${NC}"
+echo -e "${BLUE}╚══════════════════════════════════════╝${NC}"
+echo ""
+
+# ---------------------------------------------------------------------------
+# ask_yes_no PROMPT — reads from /dev/tty so it works under `curl | bash`.
+# Returns 0 on yes; anything else (incl. no tty) is treated as "no".
+# ---------------------------------------------------------------------------
+ask_yes_no() {
+    local reply
+    if [ ! -r /dev/tty ]; then
+        warn "(no /dev/tty — treating as 'no')"
+        return 1
+    fi
+    printf "%s [y/N]: " "$1" > /dev/tty
+    read -r reply < /dev/tty || return 1
+    case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
-print_warning() {
-    echo -e "${YELLOW}⚠️  $1${NC}"
-}
-
-print_info() {
-    echo -e "${BLUE}ℹ️  $1${NC}"
-}
-
-# Check if Python 3 is installed
-check_python() {
-    if command -v python3 &> /dev/null; then
-        PYTHON_VERSION=$(python3 --version 2>&1 | awk '{print $2}')
-        print_success "Python $PYTHON_VERSION found"
-        return 0
+# ---------------------------------------------------------------------------
+# fall_back_to_pip — hand off to the Python/pip installer for platforms with no
+# prebuilt binary. Runs it in-place via the same shell.
+# ---------------------------------------------------------------------------
+fall_back_to_pip() {
+    warn "No prebuilt binary for this platform — falling back to the pip installer."
+    warn "(needs Python 3.9+; it will use uv/pipx/pip, bootstrapping uv if needed)"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$FALLBACK_URL" | bash
     else
-        print_error "Python 3 is not installed"
-        echo "Please install Python 3.9 or later from https://python.org"
+        err "curl not found; install Python + run: pip install claude-statusbar && cs --setup"
         exit 1
     fi
+    exit $?
 }
 
-# Check if claude-monitor is installed and install if needed
-check_claude_monitor() {
-    echo -e "\n${BLUE}Checking claude-monitor installation...${NC}"
-    
-    # Check if any version of claude-monitor is available
-    if command -v claude-monitor &> /dev/null || \
-       command -v cmonitor &> /dev/null || \
-       command -v ccmonitor &> /dev/null || \
-       command -v ccm &> /dev/null; then
-        print_success "claude-monitor is already installed"
-        return 0
-    fi
-    
-    print_warning "claude-monitor not found. Need to install it."
-    echo -e "\nChoose installation method:"
-    echo "1) uv (recommended - fastest and cleanest)"
-    echo "2) pip (standard Python package manager)"
-    echo "3) pipx (isolated environment)"
-    echo "4) Skip (use fallback mode - less accurate)"
-    
-    read -p "Enter your choice (1-4): " choice
-    
-    case $choice in
-        1)
-            install_with_uv
-            ;;
-        2)
-            install_with_pip
-            ;;
-        3)
-            install_with_pipx
-            ;;
-        4)
-            print_warning "Skipping claude-monitor installation"
-            print_info "The status bar will use fallback mode (less accurate)"
-            ;;
-        *)
-            print_error "Invalid choice"
-            exit 1
-            ;;
+# ---------------------------------------------------------------------------
+# detect_asset — echo the release asset name for this OS/arch, or "" if none.
+# ---------------------------------------------------------------------------
+detect_asset() {
+    local os arch
+    case "$(uname -s)" in
+        Darwin) os="darwin" ;;
+        Linux)  os="linux"  ;;
+        *)      echo ""; return ;;
+    esac
+    case "$(uname -m)" in
+        arm64|aarch64) arch="arm64" ;;
+        x86_64|amd64)  arch="x86_64" ;;
+        *)             echo ""; return ;;
+    esac
+    # Published matrix: darwin arm64, linux x86_64. Everything else (Intel mac,
+    # linux arm64, Windows) has no prebuilt binary → fall back to pip.
+    case "$os-$arch" in
+        darwin-arm64|linux-x86_64) echo "cs-${os}-${arch}.tar.gz" ;;
+        *)                         echo "" ;;
     esac
 }
 
-# Install with uv
-install_with_uv() {
-    print_info "Installing with uv..."
-    
-    # Check if uv is installed
-    if ! command -v uv &> /dev/null; then
-        print_info "Installing uv first..."
-        
-        if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$OSTYPE" == "win32" ]]; then
-            # Windows
-            powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-        else
-            # macOS/Linux
-            curl -LsSf https://astral.sh/uv/install.sh | sh
-        fi
-        
-        # Add uv to current session PATH
-        export PATH="$HOME/.cargo/bin:$PATH"
-        
-        if ! command -v uv &> /dev/null; then
-            print_error "Failed to install uv"
-            print_info "Please restart your terminal and run this script again"
-            exit 1
-        fi
-    fi
-    
-    # Install claude-monitor with uv
-    uv tool install claude-monitor
-    
-    if command -v claude-monitor &> /dev/null; then
-        print_success "claude-monitor installed successfully with uv"
+# ---------------------------------------------------------------------------
+# sha256_of FILE — portable SHA-256 (shasum on macOS, sha256sum on Linux).
+# ---------------------------------------------------------------------------
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
     else
-        print_error "Installation failed"
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+verify_checksum() {
+    local base="$1" asset="$2" directory="$3" want got
+    if ! curl -fsSL "$base/$asset.sha256" -o "$directory/$asset.sha256"; then
+        err "Checksum file unavailable for $asset; refusing to install."
+        exit 1
+    fi
+    want="$(awk '{print $1}' "$directory/$asset.sha256")"
+    got="$(sha256_of "$directory/$asset")"
+    if [ "$want" != "$got" ]; then
+        err "Checksum mismatch for $asset; refusing to install."
+        exit 1
+    fi
+    ok "✓ Checksum verified"
+}
+
+verify_apple_signature() {
+    local target="$1" info
+    codesign --verify --strict "$target" || { err "Apple signature verification failed."; exit 1; }
+    info="$(codesign --display --verbose=4 "$target" 2>&1)"
+    if ! [[ "$info" == *"Authority=Developer ID Application:"* &&
+            "$info" == *"TeamIdentifier=6ZPXG4KVVS"* ]]; then
+        err "Unexpected developer identity; refusing to install."
         exit 1
     fi
 }
 
-# Install with pip
-install_with_pip() {
-    print_info "Installing with pip..."
-    
-    # Try to install with pip
-    if pip3 install --user claude-monitor 2>/dev/null || pip3 install claude-monitor 2>/dev/null; then
-        print_success "claude-monitor installed successfully with pip"
-        
-        # Check if ~/.local/bin is in PATH
-        if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-            print_warning "~/.local/bin is not in your PATH"
-            print_info "Add this line to your shell config file:"
-            echo 'export PATH="$HOME/.local/bin:$PATH"'
-        fi
+# ---------------------------------------------------------------------------
+# stop_old_daemon — stop the legacy onefile daemon before replacing the
+# launcher. Its `_MEI*` directory can be hours old while still in active use,
+# so age alone is never a safe cleanup criterion.
+# ---------------------------------------------------------------------------
+stop_old_daemon() {
+    if [ -x "$INSTALL_DIR/cs" ]; then
+        "$INSTALL_DIR/cs" daemon stop >/dev/null 2>&1 || true
+        # The HUD is another long-lived frozen process. Stop it before old
+        # onedir versions are pruned; the installer restarts it below when the
+        # Claude desktop app is present.
+        "$INSTALL_DIR/cs" hud stop >/dev/null 2>&1 || true
+    fi
+}
+
+# BSD mv follows a destination symlink to a directory unless `-h` is passed;
+# GNU mv uses `-T` for the same no-follow replacement semantics.
+replace_path_atomically() {
+    local source="$1" target="$2"
+    if [ "$(uname -s)" = "Darwin" ]; then
+        mv -fh "$source" "$target"
     else
-        print_error "pip installation failed"
-        print_info "You might need to use: pip3 install --break-system-packages claude-monitor"
-        print_info "Or better: use a virtual environment"
-        exit 1
+        mv -fT "$source" "$target"
     fi
 }
 
-# Install with pipx
-install_with_pipx() {
-    print_info "Installing with pipx..."
-    
-    # Check if pipx is installed
-    if ! command -v pipx &> /dev/null; then
-        print_info "Installing pipx first..."
-        
-        if command -v apt-get &> /dev/null; then
-            sudo apt-get install -y pipx
-        elif command -v brew &> /dev/null; then
-            brew install pipx
-        else
-            pip3 install --user pipx
-        fi
-        
-        pipx ensurepath
-    fi
-    
-    # Install claude-monitor with pipx
-    pipx install claude-monitor
-    
-    if command -v claude-monitor &> /dev/null; then
-        print_success "claude-monitor installed successfully with pipx"
-    else
-        print_error "Installation failed"
-        exit 1
-    fi
-}
+# ---------------------------------------------------------------------------
+# install_onedir_bundle SOURCE_DIR — copy a release bundle into a content-
+# addressed version directory and atomically repoint ~/.local/bin/cs through a
+# stable `current` symlink. A failed copy can never leave a half-written CLI.
+# Sets INSTALLED_BUNDLE_DIR to the final bundle directory.
+# ---------------------------------------------------------------------------
+install_onedir_bundle() {
+    local source_dir="$1"
+    mkdir -p "$INSTALL_DIR" "$BUNDLE_ROOT"
 
-# Make statusbar.py executable
-make_executable() {
-    print_info "Making statusbar.py executable..."
-    chmod +x "$SCRIPT_PATH"
-    print_success "statusbar.py is now executable"
-}
+    INSTALL_STAGE="$(mktemp -d "$BUNDLE_ROOT/.install.XXXXXX")"
+    cp -R "$source_dir/." "$INSTALL_STAGE/"
+    chmod 0755 "$INSTALL_STAGE/cs"
 
-# Test the installation
-test_installation() {
-    echo -e "\n${BLUE}Testing installation...${NC}"
-    
-    if OUTPUT=$("$SCRIPT_PATH" 2>&1); then
-        print_success "Status bar is working!"
-        echo -e "\nOutput: $OUTPUT"
-    else
-        print_error "Status bar test failed"
-        echo "Error output: $OUTPUT"
-        exit 1
-    fi
-}
-
-# Configure shell aliases
-configure_aliases() {
-    echo -e "\n${BLUE}Configure shell aliases?${NC}"
-    echo "This will add convenient shortcuts to your shell configuration"
-    read -p "Add aliases? (y/n): " -n 1 -r
-    echo
-    
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        print_info "Skipping alias configuration"
-        return
-    fi
-    
-    # Detect shell
-    SHELL_NAME=$(basename "$SHELL")
-    CONFIG_FILE=""
-    
-    case "$SHELL_NAME" in
-        bash)
-            CONFIG_FILE="$HOME/.bashrc"
-            ;;
-        zsh)
-            CONFIG_FILE="$HOME/.zshrc"
-            ;;
-        fish)
-            CONFIG_FILE="$HOME/.config/fish/config.fish"
-            ;;
-        *)
-            print_warning "Unknown shell: $SHELL_NAME"
-            print_info "Please manually add aliases to your shell configuration"
-            return
-            ;;
+    local version_line version build_id final_dir next_link
+    version_line="$("$INSTALL_STAGE/cs" --version)"
+    version="${version_line##* }"
+    case "$version" in
+        ''|*[!A-Za-z0-9._-]*) err "Invalid cs version in release bundle: $version_line"; exit 1 ;;
     esac
-    
-    # Alias lines to add
-    ALIAS_MARKER="# Claude Status Bar Monitor aliases"
-    ALIAS_LINES="
-$ALIAS_MARKER
-alias claude-status='$SCRIPT_PATH'
-alias cs='$SCRIPT_PATH'
-alias cstatus='$SCRIPT_PATH'
-"
-    
-    # Check if aliases already exist
-    if grep -q "$ALIAS_MARKER" "$CONFIG_FILE" 2>/dev/null; then
-        print_info "Aliases already configured in $CONFIG_FILE"
+    build_id="$(sha256_of "$INSTALL_STAGE/cs" | cut -c1-12)"
+    final_dir="$BUNDLE_ROOT/v${version}-${build_id}"
+
+    if [ -d "$final_dir" ]; then
+        rm -rf "$INSTALL_STAGE"
     else
-        echo "$ALIAS_LINES" >> "$CONFIG_FILE"
-        print_success "Aliases added to $CONFIG_FILE"
-        print_info "Run 'source $CONFIG_FILE' to use them in current session"
+        mv "$INSTALL_STAGE" "$final_dir"
     fi
-    
-    echo -e "\n${GREEN}Available commands:${NC}"
-    echo "  claude-status  - Check Claude usage"
-    echo "  cs            - Short alias"
-    echo "  cstatus       - Alternative alias"
+    INSTALL_STAGE=""
+
+    stop_old_daemon
+
+    # `current` must remain a symlink owned by this installer. Refuse to move a
+    # real directory out of the way: it may contain user data from a custom
+    # CS_BUNDLE_ROOT.
+    if [ -e "$BUNDLE_ROOT/current" ] && [ ! -L "$BUNDLE_ROOT/current" ]; then
+        err "$BUNDLE_ROOT/current exists and is not a symlink; refusing to replace it."
+        exit 1
+    fi
+    next_link="$BUNDLE_ROOT/.current.$$"
+    ln -s "$final_dir" "$next_link"
+    replace_path_atomically "$next_link" "$BUNDLE_ROOT/current"
+
+    # Atomic rename replaces either a previous symlink or the legacy regular
+    # binary without ever exposing a missing `cs` path to Claude Code.
+    next_link="$INSTALL_DIR/.cs.$$"
+    ln -s "$BUNDLE_ROOT/current/cs" "$next_link"
+    replace_path_atomically "$next_link" "$INSTALL_DIR/cs"
+    ln -sfn "$INSTALL_DIR/cs" "$INSTALL_DIR/claude-statusbar"
+    ln -sfn "$INSTALL_DIR/cs" "$INSTALL_DIR/cstatus"
+
+    INSTALLED_BUNDLE_DIR="$final_dir"
 }
 
-# Integration options
-show_integration_options() {
-    echo -e "\n${BLUE}Integration Options${NC}"
-    echo "You can integrate the status bar with:"
-    echo ""
-    echo "1. tmux (add to ~/.tmux.conf):"
-    echo "   set -g status-right '#($SCRIPT_PATH)'"
-    echo "   set -g status-interval 10"
-    echo ""
-    echo "2. Zsh prompt (add to ~/.zshrc):"
-    echo "   claude_usage() { $SCRIPT_PATH }"
-    echo "   RPROMPT='\$(claude_usage)'"
-    echo ""
-    echo "3. i3 status bar (add to i3 config):"
-    echo "   bar {"
-    echo "       status_command while :; do echo \"\$($SCRIPT_PATH)\"; sleep 10; done"
-    echo "   }"
+# ---------------------------------------------------------------------------
+# prune_old_bundles KEEP_DIR — the new daemon is already running before this
+# executes, so no process needs a previous onedir version.
+#
+# One exception: an unattended `cs upgrade` runs *out of* an old bundle, and a
+# PyInstaller onedir binary dlopens its libraries lazily — deleting that dir
+# mid-run can kill the upgrade while it is still working. The updater passes
+# its own bundle in CS_KEEP_BUNDLE_DIR; the next upgrade prunes it once nothing
+# is running inside it.
+# ---------------------------------------------------------------------------
+prune_old_bundles() {
+    local keep_dir="$1" old
+    for old in "$BUNDLE_ROOT"/v*; do
+        [ -e "$old" ] || continue
+        [ "$old" = "$keep_dir" ] && continue
+        [ -n "${CS_KEEP_BUNDLE_DIR:-}" ] && [ "$old" = "$CS_KEEP_BUNDLE_DIR" ] && continue
+        [ -d "$old" ] && [ ! -L "$old" ] && rm -rf "$old"
+    done
 }
 
-# Main installation flow
 main() {
-    # Check Python
-    check_python
-    
-    # Check and install claude-monitor
-    check_claude_monitor
-    
-    # Make script executable
-    make_executable
-    
-    # Test installation
-    test_installation
-    
-    # Configure aliases
-    configure_aliases
-    
-    # Show integration options
-    show_integration_options
-    
-    echo -e "\n${GREEN}==================================${NC}"
-    echo -e "${GREEN}Installation Complete! 🎉${NC}"
-    echo -e "${GREEN}==================================${NC}"
-    echo ""
-    echo "Run '$SCRIPT_PATH' or use configured aliases to check Claude usage"
-    echo "For more information, see: $SCRIPT_DIR/README.md"
+    command -v curl >/dev/null 2>&1 || { err "curl is required."; exit 1; }
+
+    local asset
+    asset="$(detect_asset)"
+    [ -n "$asset" ] || fall_back_to_pip
+
+    # CS_RELEASE_BASE_URL pins the download to one release. `cs upgrade` sets it
+    # to the exact tag it decided to install, because `releases/latest/download`
+    # lags for a while after publishing — long enough for an upgrade to fetch
+    # the version it was upgrading away from. Also used by the offline
+    # installer integration test.
+    local base="${CS_RELEASE_BASE_URL:-https://github.com/${REPO}/releases/latest/download}"
+    # NOTE: the scratch dir must be a global, not a `local`. The EXIT trap runs
+    # after this function has already returned, so a local `tmp` is out of scope
+    # by then — under `set -u` that ended the install with a bare
+    # "tmp: unbound variable", and the temp dir was never cleaned up.
+    TMP_DIR="$(mktemp -d)"
+    local tmp="$TMP_DIR"
+
+    # Prefer a stapled, notarized disk image on supported Macs. Only a genuine
+    # 404 (or an absent offline fixture) permits the legacy tar path; a network
+    # or server error must not silently downgrade the authenticity checks.
+    if [ "$(uname -s)" = "Darwin" ]; then
+        local dmg_asset="cs-darwin-arm64.dmg" status effective
+        say "Checking for the notarized macOS disk image..."
+        if status="$(curl -sSL -w '%{http_code} %{url_effective}' "$base/$dmg_asset" -o "$tmp/$dmg_asset")"; then
+            effective="${status#* }"
+            status="${status%% *}"
+            if [ "$status" = "200" ] || [ "$status" = "000" ]; then
+                verify_checksum "$base" "$dmg_asset" "$tmp"
+                verify_apple_signature "$tmp/$dmg_asset"
+                spctl --assess --type open --context context:primary-signature "$tmp/$dmg_asset" || {
+                    err "Gatekeeper did not accept the disk image; refusing to install."; exit 1;
+                }
+                ok "✓ Apple signature and notarization verified"
+                mkdir -p "$tmp/mounted"
+                hdiutil attach "$tmp/$dmg_asset" -readonly -nobrowse -noautoopen -mountpoint "$tmp/mounted" >/dev/null
+                DMG_MOUNT="$tmp/mounted"
+                verify_apple_signature "$DMG_MOUNT/cs/cs"
+                verify_apple_signature "$DMG_MOUNT/cs/cs-python"
+                install_onedir_bundle "$DMG_MOUNT/cs"
+                finish_install "onedir" "$INSTALLED_BUNDLE_DIR"
+                return
+            elif [ "$status" = "404" ]; then
+                if [[ "$base" == */download/v* && "$effective" != */download/v* ]]; then
+                    effective="$base/"
+                fi
+                if [[ "$base" == "https://github.com/$REPO/releases/latest/download" &&
+                      "$effective" != */download/v* ]]; then
+                    local latest
+                    latest="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" |
+                        sed -n 's/.*"tag_name":[[:space:]]*"\(v[0-9]*\.[0-9]*\.[0-9]*\)".*/\1/p')"
+                    [ -n "$latest" ] || { err "Could not resolve the release; retry later."; exit 1; }
+                    effective="https://github.com/$REPO/releases/download/$latest/"
+                fi
+                if [[ "$effective" =~ /download/v([0-9]+)\.([0-9]+)\.([0-9]+)/ ]] &&
+                   { [ "${BASH_REMATCH[1]}" -gt 3 ] ||
+                     { [ "${BASH_REMATCH[1]}" -eq 3 ] && [ "${BASH_REMATCH[2]}" -ge 46 ]; }; }; then
+                    err "The notarized disk image is missing for this release; refusing to downgrade."
+                    exit 1
+                fi
+            else
+                err "Disk image download returned HTTP $status; refusing to downgrade."; exit 1
+            fi
+        elif [[ "$base" != file://* ]]; then
+            err "Disk image download failed; retry when the network is available."; exit 1
+        fi
+    fi
+
+    say "Downloading $asset from the latest release..."
+    if ! curl -fsSL "$base/$asset" -o "$tmp/$asset"; then
+        warn "Download failed (no release asset yet?)."
+        fall_back_to_pip
+    fi
+
+    verify_checksum "$base" "$asset" "$tmp"
+
+    say "Extracting..."
+    tar -xzf "$tmp/$asset" -C "$tmp"
+    local install_mode bundle_dir
+    if [ -x "$tmp/cs/cs" ]; then
+        install_mode="onedir"
+        install_onedir_bundle "$tmp/cs"
+        bundle_dir="$INSTALLED_BUNDLE_DIR"
+        ok "✓ Installed cs bundle → $bundle_dir"
+        ok "✓ Linked cs → $INSTALL_DIR/cs ($("$INSTALL_DIR/cs" --version 2>/dev/null || echo 'version unknown'))"
+        warn_about_duplicate_installs
+    elif [ -f "$tmp/cs" ]; then
+        # Transition compatibility: `main/install.sh` can be newer than the
+        # latest Release for a short window while CI is still building the
+        # first onedir asset. Keep old releases installable, but do not pretend
+        # they have fixed the onefile extraction problem.
+        install_mode="legacy-onefile"
+        bundle_dir=""
+        stop_old_daemon
+        mkdir -p "$INSTALL_DIR"
+        rm -f "$INSTALL_DIR/cs"
+        install -m 0755 "$tmp/cs" "$INSTALL_DIR/cs"
+        ln -sfn "$INSTALL_DIR/cs" "$INSTALL_DIR/claude-statusbar"
+        ln -sfn "$INSTALL_DIR/cs" "$INSTALL_DIR/cstatus"
+        warn "Installed a legacy onefile asset; update again after the new onedir Release finishes building."
+    else
+        err "Archive did not contain a 'cs' bundle."
+        exit 1
+    fi
+
+    finish_install "$install_mode" "$bundle_dir"
 }
 
-# Run main function
-main
+finish_install() {
+    local install_mode="$1" bundle_dir="$2"
+
+    # Ensure the install dir is on PATH.
+    if ! command -v cs >/dev/null 2>&1 || [ "$(command -v cs)" != "$INSTALL_DIR/cs" ]; then
+        if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
+            warn "$INSTALL_DIR is not on your PATH."
+            if ask_yes_no "Append 'export PATH=\"$INSTALL_DIR:\$PATH\"' to ~/.bashrc and ~/.zshrc?"; then
+                for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+                    echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$rc" 2>/dev/null || true
+                done
+                ok "✓ PATH updated (open a new shell, or run: export PATH=\"$INSTALL_DIR:\$PATH\")"
+            else
+                warn "Skipped. Add $INSTALL_DIR to your PATH manually to use 'cs'."
+            fi
+        fi
+    fi
+    export PATH="$INSTALL_DIR:$PATH"
+
+    say "Wiring Claude Code statusLine (cs --setup)..."
+    local setup_ok=1
+    if [ "${CS_SKIP_SETUP:-0}" = "1" ]; then
+        setup_ok=0
+        say "Binary installed; setup skipped."
+    elif ! "$INSTALL_DIR/cs" --setup; then
+        setup_ok=0
+        warn "cs --setup reported an issue; run it manually if the bar doesn't appear."
+    fi
+
+    if [ "$install_mode" = "onedir" ] && [ "${CS_SKIP_SETUP:-0}" != "1" ]; then
+        # The new process is onedir, so this scan cannot create another `_MEI`.
+        # cleanup.py refuses to delete unless lsof proves the legacy directory
+        # inactive; if that proof is unavailable, it leaves everything alone.
+        "$INSTALL_DIR/cs" -m claude_statusbar.cleanup || true
+        [ "$setup_ok" -eq 1 ] && prune_old_bundles "$bundle_dir"
+    fi
+
+    # macOS: if the Claude *desktop* app is installed, wire the floating HUD too,
+    # so a single install covers BOTH surfaces — the terminal statusLine and the
+    # desktop panel — with no extra steps. The macOS binary bundles the HUD, so
+    # this needs no Python/pip and rides the same auto-update.
+    if [ "${CS_SKIP_SETUP:-0}" != "1" ] && [ "$(uname -s)" = "Darwin" ] && \
+       { [ -d "/Applications/Claude.app" ] || [ -d "$HOME/Applications/Claude.app" ]; }; then
+        say "Detected the Claude desktop app — installing the floating HUD..."
+        if "$INSTALL_DIR/cs" hud install; then
+            ok "✓ Desktop HUD installed — auto-starts on login (drag to place, click to expand)"
+        else
+            warn "HUD setup hit an issue; run 'cs hud install' to retry."
+        fi
+    fi
+
+    echo ""
+    ok "═══════════════════════════════════════"
+    ok "Install complete."
+    ok "═══════════════════════════════════════"
+    echo "  Upgrade: live on the next statusline tick — no restart needed."
+    echo "  First install: restart Claude Code once so the status bar appears."
+    echo "  cs doctor    # verify the wiring"
+    echo "  cs preview   # try every style × theme"
+    echo ""
+    echo "Update later:   curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash"
+    echo "Desktop HUD:    auto-installed above if the Claude desktop app was found (macOS)."
+    echo "                otherwise: cs hud install"
+}
+
+main "$@"

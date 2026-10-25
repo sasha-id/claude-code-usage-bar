@@ -9,7 +9,13 @@
 - Install for development (editable): `python -m pip install -e .`
 - Run locally: `claude-statusbar` (or `python -m claude_statusbar.cli --version` to verify wiring).
 - Build distribution: `python -m build` (requires `build`/`wheel`).
-- Publish to PyPI: `./publish.sh` (expects `PYPI_API_TOKEN` or `~/.pypirc`; offers TestPyPI first).
+- Release: bump the version in `pyproject.toml` (plus both `.claude-plugin`
+  manifests) and add the CHANGELOG section — merging that to `main` triggers
+  `.github/workflows/release.yml`, which stages binary build artifacts and
+  uploads to PyPI, then verifies binary checksums before publishing the release.
+  A retry fills missing artifacts from the original tag; existing platform
+  bundles stay intact. `./publish.sh` is the manual fallback (expects
+  `PYPI_API_TOKEN` or `~/.pypirc`; offers TestPyPI first).
 - Install optional dependency for richer data: `python -m claude_statusbar.cli --install-deps` then follow prompts for `claude-monitor`.
 
 ## Coding Style & Naming Conventions
@@ -18,7 +24,9 @@
 - Prefer pure functions with clear return types; add `typing` hints where missing and keep logging quiet (current default ERROR).
 
 ## Testing Guidelines
-- No automated suite exists yet; add targeted `pytest` cases around `core.main`, calculation helpers, and file parsing when you touch logic.
+- Run `PYTHONPATH=src python -m pytest tests/ -q` for the automated suite. Add regression cases around parsing, account isolation and cross-process cache updates when changing logic.
+- Run `ruff check .` and `actionlint .github/workflows/*.yml`; both are blocking CI checks.
+- Use synthetic credentials and isolated homes in tests and benchmarks. Benchmark official-quota and no-quota sessions separately.
 - For manual checks: place sample Claude JSONL data under `~/.claude/projects/`, run `claude-statusbar`, and confirm token/cost figures and reset timer behave as expected across empty/malformed files.
 - If introducing flags, verify CLI help stays readable: `python -m claude_statusbar.cli --help`.
 
@@ -30,3 +38,16 @@
 ## Security & Configuration Tips
 - The tool reads from user-local Claude data under `~/.claude/`; avoid logging or committing any captured traces.
 - Publishing requires secrets (`PYPI_API_TOKEN`); export them locally and never bake into scripts. Use TestPyPI when unsure about release artifacts.
+
+## macOS signing
+- Public macOS releases from 3.46.0 require a Developer ID signed, notarized and
+  stapled DMG plus its checksum, alongside the compatibility tar archive.
+- `scripts/sign_macos.py` signs nested binaries before framework seals, validates
+  the signer, notarizes and staples the DMG, then generates both archive checksums.
+- CI reuses the existing Apple signing configuration in encrypted repository
+  Secrets. `scripts/macos_ci_keychain.sh` creates a disposable signing keychain;
+  the workflow must run its cleanup step with `always()`.
+- Never export credentials into source, logs or artifacts. Shared configuration
+  transfers must be encrypted for the target repository public key.
+- `CS_SKIP_SETUP=1` permits isolated installer acceptance without touching live
+  daemon/HUD services. Public installation keeps setup enabled.

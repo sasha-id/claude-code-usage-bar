@@ -1,0 +1,2256 @@
+# Changelog
+
+All notable changes to `claude-statusbar` are documented here. The format
+loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
+the project uses [Semantic Versioning](https://semver.org/).
+
+For a quick overview of the latest release, see the
+[GitHub releases page](https://github.com/leeguooooo/claude-code-usage-bar/releases).
+
+---
+
+## v3.52.2 — 2026-10-24
+
+- Prevent a newly observed session replaying an older quota snapshot from
+  lowering the shared account reading after its confirmation grace expires.
+  For example, a frozen 91% weekly reading no longer replaces a recorded 100%.
+- Require a subsequent change in that window's raw quota signature, newer
+  than the shared value, before accepting a downward recalibration.
+  A change in 5h usage cannot make an unchanged weekly snapshot fresh.
+  Genuine recalibrations still use the existing grace period; unchanged
+  snapshots remain unable to confirm or overwrite quota after their idle TTL.
+- Cover late-session replays, delayed recalibrations, and concurrent writes
+  from separate processes with regression tests.
+
+---
+
+## v3.52.1 — 2026-10-23
+
+- Preserve complete model names and other segments containing ` | ` or `│`
+  when the narrow layout stacks rows.
+- Limit label alignment to the space available in each row, so an oversized
+  per-model label cannot push the 5h/7d bars out of view.
+- Shorten only overflowing quota segments: keep fitting projections when
+  another quota or the model name is too wide. An oversized per-model row
+  drops its own projection before clipping, without rearranging a fitting
+  first line. The default `drop` layout keeps its existing behavior.
+
+---
+
+## v3.52.0 — 2026-10-23
+
+**Keep quota forecasts visible in narrow panes.**
+
+- Opt in with `cs config set narrow_layout stack`: quota bars and other
+  segments move onto additional rows when the first line exceeds the pane
+  width. Per-model quota labels align with the 5h/7d bars. The default
+  remains `drop`; a fitting first line keeps its layout (#73, #78).
+- Preserve the per-model quota row when the default layout removes optional
+  first-line segments to fit the pane.
+- Add ccx to the English and Chinese integration guides, with the correct
+  warning conditions: 5-hour usage above 90%, or weekly quota exhausted (#76).
+
+---
+
+## v3.51.2 — 2026-10-22
+
+- The `✦ New looks available` hint now also goes away when a look is chosen
+  without the picker — `/statusbar-style`, the skill, or
+  `cs config set style|bar_glyph`. Before, only `cs theme` cleared it.
+
+---
+
+## v3.51.1 — 2026-10-22
+
+- Worktree marker reads `worktree (🌳3)` / `fix-login (🌳3)`: no leading `⑂`,
+  the glyph sits inside the count and defaults to 🌳. A `worktree_glyph` you
+  set yourself is kept and moves inside the parentheses.
+
+---
+
+## v3.51.0 — 2026-10-22
+
+**New looks get offered, not just shipped.**
+
+- After an interactive `cs upgrade`, the new build opens the `cs theme`
+  picker if it ships looks you haven't chosen from yet. Background
+  auto-upgrades can't prompt, so the bar shows a faint
+  `✦ New looks available · run cs theme to pick one` line until you open the
+  picker once (picking or cancelling both count).
+- Driven by `LOOKS_VERSION` in `config.py` vs. the new `looks_seen` key —
+  bump the constant whenever a release changes the looks, and everyone gets
+  asked again.
+- The main checkout is labelled `⑂ worktree (N)` in both languages (was
+  `主工作区` / `main checkout`).
+
+---
+
+## v3.50.2 — 2026-10-22
+
+- `cs theme` follows the `lang` setting (auto / zh / en) instead of always
+  speaking Chinese.
+- The README now opens with a GIF of the `cs theme` picker
+  (`scripts/picker.tape`; `TRIM=0 scripts/build-hero-gif.sh scripts/picker.tape`).
+
+---
+
+## v3.50.1 — 2026-10-22
+
+**`cs theme` is now an interactive picker.**
+
+- `cs theme` (also `themes` / `looks`) shows the three looks with a live
+  preview from your real numbers; ↑/↓ or 1-3 to move, Enter applies, q
+  cancels. Piped or non-terminal output prints the list with the current look
+  marked. Windows falls back to typing a number.
+- Re-running `cs --setup` / `cs install-commands` removes the retired
+  `/statusbar-theme` command, unless you edited it.
+
+---
+
+## v3.50.0 — 2026-10-22
+
+**Three looks instead of 4 styles × 9 themes.**
+
+- What's left: aurora with `■` block bars (default), aurora with a thin `━`
+  line (`cs config set bar_glyph thin`), and classic
+  (`cs config set style classic`), all on the graphite palette. `cs preview`
+  shows the three side by side.
+- Removed the `capsule` and `hairline` styles, the eight non-graphite themes,
+  `/statusbar-theme`, and `auto_compact_width` (it switched to hairline; the
+  key is still accepted and ignored). Configs naming any of them fall back to
+  aurora / graphite on the next render; `classic` is kept.
+- Severity colors are still tunable with `color_ok` / `color_warn` /
+  `color_hot` / `color_worktree`.
+- README trimmed: the bar is now at the top, internals moved to
+  `docs/daemon.md` and `CONTRIBUTING.md`; the hero GIF shows the three looks.
+
+---
+
+## v3.49.6 — 2026-10-22
+
+**Thicker aurora bars, and no more "ip check unavailable" noise.**
+
+- Aurora bars now use `■` blocks by default — the thin `━` line read as too
+  faint. Same colors and gradient. Prefer the old look?
+  `cs config set bar_glyph thin`.
+- When the IP risk check can't run, the status line now stays quiet instead
+  of showing `ip ? check unavailable`. `cs doctor` still reports it.
+
+---
+
+## v3.49.5 — 2026-10-22
+
+**Use a clearer name for the main checkout.**
+
+- Replace the `trunk` worktree marker with `主工作区` in Chinese and
+  `main checkout` in English, following the UI language setting. Branch
+  names and linked worktree names are unchanged.
+
+---
+
+## v3.49.4 — 2026-10-22
+
+**Hide the extra effort/thinking/fast/style line by default.**
+
+- New installs and upgrades hide the `⚙ effort:… · think:… · fast:… · style:…`
+  line. Existing configurations are migrated once, including saved `show_mode`
+  values; other appearance choices are preserved.
+- To show it again, run `cs config set show_mode true`. That choice persists.
+
+---
+
+## v3.49.3 — 2026-10-22
+
+**Aurora's lower lines are calmer and clickable.**
+
+- Lines below the first separate their parts with a faint `·` instead of
+  `│`: stacked `│`s at unrelated offsets read as a misaligned table. LAN peers
+  are separated by spacing only.
+- Unread ocs messages read `4 unread` / `4 条未读` (by system language)
+  instead of the `✉` glyph, which terminals draw as a mismatched emoji.
+- Cmd/Ctrl+click opens: the repo name (its web page, from the `origin`
+  remote), the branch (its page on GitHub / GitLab / Bitbucket-style forges),
+  the `↑version` hint (release notes), a network notice (the ip-check page)
+  and `cs doctor` (the troubleshooting docs). Links are OSC 8, which Claude
+  Code's status line supports in terminals like Ghostty, iTerm2, Kitty and
+  WezTerm; elsewhere the text simply isn't clickable. Remote credentials never
+  appear in a link, and clipping a line closes any link it cuts.
+
+---
+
+## v3.49.2 — 2026-10-22
+
+**Updates arrive within hours, the cache countdown trusts Claude Code's expiry, and stuck installs get a guide.**
+
+- Auto-upgrade checks every 6 hours instead of once a day, so a release reaches
+  active machines the same day. Four checks a day stay far below GitHub's
+  unauthenticated rate limit even behind a shared IP.
+- Standalone binaries now cache the latest version they resolve from GitHub
+  Releases, so the `↑newver` hint and `cs doctor`'s `latest` line see new
+  releases (they were stuck on whatever PyPI said last). `cs doctor` no longer
+  prints a cached "latest" older than the installed version.
+- The cache countdown uses Claude Code's `prompt_cache.expires_at` when it is
+  sent (Claude Code 2.1.308+), so a cache refreshed without a new assistant
+  turn (e.g. a keep-alive fork) no longer shows `COLD`. Older Claude Code keeps
+  the transcript-based countdown (#72, thanks @azliabdullah).
+- README and troubleshooting list the releases whose updater can't upgrade
+  itself, with the one command each needs (`cs upgrade` or the installer).
+- Tests no longer start, stop or restart the developer's real daemon service,
+  and no longer write the real version cache.
+
+---
+
+## v3.49.1 — 2026-10-22
+
+**Quota stores are per organization; an upgrade whose daemon didn't restart retries only the restart.**
+
+- The 5h/7d stores, projection history and quota snapshots are keyed by
+  account *and* organization (`oauthAccount.organizationUuid`). One login can
+  belong to a personal Max org and a Team org, each with its own counters and
+  rate-limit tier; switching between them no longer mixes their readings.
+  Existing history moves to the current organization on first use, so a
+  single-org login keeps its projections.
+- After a binary upgrade installs, `cs upgrade` and the background
+  auto-upgrade check that the daemon came back on the new code. If it did not,
+  they retry just the restart (launchd / systemd, or `cs daemon start`) twice,
+  never another download. `cs upgrade` then says
+  `Installed vX, but the background daemon did not restart (…)` with the retry
+  command, and `cs doctor` shows a `last upgrade` line while the daemon stays down.
+
+---
+
+## v3.49.0 — 2026-10-22
+
+**One look for everyone: aurora, a brighter green, and quieter lower lines.**
+
+- Upgrading moves every config to `aurora` once, including an explicit
+  `classic` / `capsule` / `hairline`. The file records `ui_version`, so a
+  choice made afterwards (`cs config set style classic`) sticks.
+- The default `graphite` theme's green is now `#4ec85b`. Other themes and
+  your own `color_ok` are unchanged.
+- In aurora, line 1 keeps the color and the lines below recede: grey text,
+  with the diff counts, dirty / ahead-behind flags and LAN dots in muted hues.
+  `⑂ trunk (N)` shows only when other worktrees exist, and the version only
+  when an update is waiting.
+- The ocs line in aurora reads `ocs claude-b2242a10 │ ✉3 │ lan ● win · ● mac`,
+  with a dot per LAN peer (green = seen recently).
+
+---
+
+## v3.48.0 — 2026-10-22
+
+**IP and endpoint notices take one line, in your system language.**
+
+- The network notices under the status line collapse from two full-color
+  lines into one segmented line in the aurora look:
+  `✗ IPv6 CN │ unsupported region │ route unverified · cs doctor`. Only the
+  glyph, the value and the reason are colored; the `cs doctor` pointer is dim.
+- Chinese and English. `cs config set lang auto|zh|en` (default `auto`). On
+  macOS `auto` reads the first system language, so a Chinese system gets
+  `✗ IPv6 CN │ 不支持的地区 │ 实际路线未验证 · cs doctor` even when the
+  terminal's `$LANG` is `en_US.UTF-8`. Other platforms use `LC_ALL` /
+  `LC_MESSAGES` / `LANG`.
+- The custom-endpoint notice becomes a quieter `◌` note. `cs doctor` and the
+  checks behind each notice are unchanged.
+
+---
+
+## v3.47.2 — 2026-10-22
+
+**The IP check no longer goes "unavailable" when ipapi.is is out of reach.**
+
+- Some networks refuse connections to `api.ipapi.is` outright. The egress IP
+  was still known, yet every check failed and the status line kept a two-line
+  `⚠ ip check unavailable` notice. The check now falls back to our own
+  ip-check origin (the one already used for the IPv4/IPv6 readings) for the
+  risk score, type and country. A clean reading stays silent as before.
+- If both sources fail, the check is still reported as unknown.
+
+---
+
+## v3.47.1 — 2026-10-22
+
+**`aurora` is the default style; config changes show on the next render.**
+
+- New installs, and anyone who never set `style`, now get `aurora`. To go
+  back: `cs config set style classic`. An explicit `style` in
+  `~/.claude/claude-statusbar.json` is left alone.
+- `aurora` shows the `→NN%` projection and `⚠~8m` forecast chips (same rule as
+  classic: a usable projection wins) and the countdown emoji, so turning on
+  `show_projection` / `show_forecast` works in every default install.
+- `cs config set` / `unset` / `reset` drop each session's cached daemon render,
+  so the next render redraws with the new config. Before, a render right after
+  the change could show the old look for a second or two.
+
+---
+
+## v3.47.0 — 2026-10-22
+
+**New `aurora` style: thin gradient bars and a regrouped second line.**
+
+- `cs config set style aurora` switches to thin `━` bars for 5h / 7d. Each
+  cell's color is fixed by its position (green → amber → red), so a fuller bar
+  reaches further into red. The percentage keeps the projection-driven color.
+- The model gets a 6-cell context bar plus percentage in place of the
+  `(70.0k/1.0M)` suffix. Without a context reading the token suffix stays.
+- Cache countdown drops seconds once 10+ minutes remain (`❄ 59m`, `❄ 1h00m`);
+  under 10 minutes it stays exact (`❄ 4m23s`).
+- The 2nd line in aurora reads `⎇ main● ↓1 │ project │ +244 │ ⏱ 4m │ ⑂ trunk (1) │ v3.47.0`.
+  A linked worktree still leads the line in its own hue.
+- Honors `color_ok` / `color_warn` / `color_hot` and all 9 themes. `classic`
+  stays the default and is unchanged.
+
+---
+
+## v3.46.2 — 2026-10-22
+
+**Network warnings describe observations; failed checks stay visible as unknown.**
+
+- Remove timezone-based watermark assertions and timezone-change advice. A custom
+  API endpoint produces a local configuration notice, without exposing its URL.
+- Add opt-in, separately measured IPv4/IPv6 exit observations using our own
+  Cloudflare origin, never an Anthropic host. Direct family probes skip configured
+  HTTP/HTTPS/ALL proxies rather than pretending to follow a client proxy route.
+- Remove certain account-ban predictions. Different IPv4/IPv6 exit countries are
+  an amber discrepancy, not proof of an IPv6 leak or a reason to disable IPv6.
+  Independent WARP, unsupported-region and classified exit warnings retain priority.
+- Failed or stale probes show current status as unknown. Prior warnings are labelled
+  last known; repeated failures retain the previous observation without resetting
+  its timestamp. Fresh clean readings remain silent.
+- `cs doctor` adds cache/coverage information and links to IP Check and Thermo.
+  The new risk summary reads cache only and never runs a deep local scanner.
+  Existing doctor render/shell smoke checks retain normal collector behavior.
+  State, not raw IPs, credentials or endpoint URLs, is included in the summary.
+
+---
+
+## v3.46.1 — 2026-10-09
+
+**`cs doctor` shows when you're behind; a failed refresh keeps the per-model limits.**
+
+- `cs doctor` adds an `auto-upgrade` line (on, off, or blocked by another
+  install owning `cs` / a Windows pip or pipx install) and a `latest` line read
+  from the updater's cache: an available version, up to date, or unknown when
+  the last check is over 7 days old. No network call (#69, thanks @bpavlina).
+- A single timeout or keychain hiccup no longer blanks the per-model limits
+  segment. The last good limits stay for up to 10 minutes after the last
+  successful fetch; retry backoff is unchanged (#70, thanks @bpavlina).
+- The macOS installer refuses to fall back to the unsigned tar archive when a
+  3.46+ release is missing its notarized disk image.
+- Troubleshooting docs explain how uv installs stuck on 3.35.2–3.42.x get
+  unstuck (#71).
+
+---
+
+## v3.46.0 — 2026-10-07
+
+**macOS downloads are Developer ID signed and Apple notarized.**
+
+- Mac installs prefer a signed, notarized DMG with a stapled ticket, and verify
+  the developer identity before copying the CLI, runtime and desktop HUD.
+- The installer requires checksums and no longer removes quarantine attributes.
+  Existing tar archives remain available for older clients and other platforms.
+- Signing covers the native launcher, Python runtime and embedded libraries;
+  failed signatures or notarization stop publication. CI signing credentials
+  live only in a temporary keychain and are removed after the job.
+
+---
+
+## v3.45.1 — 2026-10-07
+
+**Quota stays isolated across accounts and concurrent windows; relay balances survive daemon mode.**
+
+- Serialize account quota and projection updates across render processes, so
+  parallel windows cannot overwrite a newer reading or lose sibling sessions.
+- Recover missing quota only from account-owned snapshots (or the same session
+  when the account is unknown); global diagnostic stdin is no longer a fallback.
+- Daemon renders read relay balances through a credential-free fingerprint.
+  The session client refreshes the balance; failed usage queries keep the last
+  known value with a stale marker instead of reporting the full credit limit.
+- Identical quota snapshots no longer trigger repeated writes or fsyncs.
+- Binary artifacts stay in CI until checksum validation passes. Retries use the original
+  tag and complete missing platform assets or PyPI files without replacing
+  already uploaded platform bundles.
+- CI blocks Ruff correctness violations and invalid workflows, checks platform
+  regressions on macOS and Windows, and benchmarks official-quota sessions as
+  well as API sessions before uploading binaries.
+
+---
+
+## v3.45.0 — 2026-10-07
+
+**AgentParty support is removed.**
+
+- The AgentParty line is gone from the status bar, and the `show_party`
+  config key with it. A `show_party` value left in
+  `~/.claude/claude-statusbar.json` is ignored; `cs config set show_party`
+  now reports an unknown key.
+- The desktop HUD (`cs hud`) no longer lists AgentParty channels. The
+  expanded panel shows only the 5h / 7d bars and reset countdowns, and the
+  collapsed pill no longer pins a channel.
+- `cs` no longer reads `~/.agentparty/` or scans transcripts for `party`
+  commands.
+
+---
+
+## v3.44.0 — 2026-09-30
+
+**The ocs line shows unread DMs and the LAN bridge.**
+
+- The ocs line now reads `ocs boss · claude-7d5a5d07 · ✉3 · lan win`.
+  `✉3` is this session's unread ocs DMs, drawn in amber and hidden at
+  zero. It comes from `ocs inbox --json --session <id>`, so it appears
+  once ocs accepts `--session` there; until then that part stays hidden
+  and the rest of the line is unchanged.
+- `lan win` lists the paired LAN peers from `ocs lan status --json`, up
+  to three, with `+N` for the rest. A peer ocs heard from in the last
+  10 minutes is drawn in ink, older ones muted. `lan on` means the
+  bridge runs with nothing paired; `lan off` in amber means peers are
+  paired but the bridge is stopped (`ocs lan up`). The part is hidden
+  when the bridge is off and nothing is paired.
+- Both come from the same background refresh as the address, cached
+  about 30 seconds per session. `show_ocs false` hides the whole line.
+
+---
+
+## v3.43.11 — 2026-09-29
+
+**The daemon comes back after an upgrade.**
+
+- After an upgrade, the render sees the daemon's last output was written by
+  older code and tells that daemon to exit. If the daemon was already
+  dead, for example because it died during the upgrade, nothing ever
+  rewrote that output. So every render took the same branch, and the
+  daemon was never restarted. Without a service manager to restart it
+  (Windows, and Linux without systemd), the status line stayed on the
+  slower inline renders until someone ran `cs daemon start`. The render
+  now starts a new daemon when the old one is already gone. Reproduced
+  and verified on Windows 11.
+
+---
+
+## v3.43.10 — 2026-09-29
+
+**`cs upgrade` works on Windows again.**
+
+- 3.43.8 added `--refresh-package` to the Windows upgrade command, but
+  `uv tool upgrade` has no such option. uv rejected it ("unexpected
+  argument"), so every `cs upgrade` and background upgrade on Windows
+  failed. The install stayed intact
+  ([#67](https://github.com/leeguooooo/claude-code-usage-bar/issues/67)).
+  The flag is gone from the Windows command; the "run it again in a minute"
+  message from 3.43.9 already covers a lagging index. macOS and Linux keep
+  it, since `uv tool install` supports it.
+- When an upgrade fails, `cs upgrade` now shows the installer's own error
+  instead of only "run it by hand".
+- The tests now run our uv upgrade commands through the real uv, in CI and
+  before every release, so an argument uv doesn't accept fails the build.
+- **If you're on 3.43.8 or 3.43.9 on Windows**, upgrade once by hand:
+  `uv tool upgrade claude-statusbar`.
+
+---
+
+## v3.43.9 — 2026-09-29
+
+**`cs upgrade` no longer calls itself up to date while a new release is out.**
+
+- For about a minute after a release, the package index uv and pip read
+  from can lag PyPI's JSON API, even with `--refresh-package`. The
+  installer then exits 0 without upgrading, and `cs upgrade` reported
+  "already the latest". It now checks PyPI: if PyPI lists a newer version,
+  `cs upgrade` says the installer doesn't see it yet and to run it again in
+  a minute, and exits non-zero.
+- The background upgrade check no longer reports "Upgraded" when nothing
+  changed.
+
+---
+
+## v3.43.8 — 2026-09-29
+
+**`cs upgrade` sees a new release right away.**
+
+- uv caches the package index, and for a few minutes after a release that
+  cache can miss the new version: uv reported "Nothing to upgrade" while
+  PyPI was already serving 3.43.7. The uv upgrade commands now pass
+  `--refresh-package claude-statusbar`, which refreshes just this package
+  ([#66](https://github.com/leeguooooo/claude-code-usage-bar/issues/66)).
+
+---
+
+## v3.43.7 — 2026-09-29
+
+**`cs upgrade` works on Windows, and no longer breaks the install.**
+
+- Windows won't delete or overwrite a file that a process has open, and
+  `cs.exe` always has one while Claude Code is running: the daemon and
+  every statusLine render use it. `uv tool install --upgrade` rebuilds the
+  tool environment, so it failed halfway deleting `Scripts\` ("access
+  denied") and left `cs` failing with `ModuleNotFoundError` until a manual
+  `uv tool install --force`
+  ([#66](https://github.com/leeguooooo/claude-code-usage-bar/issues/66)).
+- On Windows, cs now upgrades with `uv tool upgrade`, which updates the
+  environment in place. First it renames the in-use `cs.exe` launchers
+  aside; Windows allows renaming a running exe. Any launcher uv didn't
+  rewrite is moved back, so `cs` can't go missing. Tested on Windows 11
+  while the daemon, the upgrading process and a render loop were all
+  running: `cs` kept working throughout.
+- Auto-upgrade had never run on Windows. uv copies launchers into its bin
+  folder instead of symlinking them, so every uv install looked like
+  someone else's copy of `cs`. uv's install receipt now settles who owns
+  the launcher.
+- pip and pipx installs on Windows don't upgrade themselves. `cs upgrade`
+  prints the steps instead.
+
+---
+
+## v3.43.6 — 2026-09-29
+
+**`cs upgrade` no longer breaks the install on Chinese-locale Windows.**
+
+- On a GBK (code page 936) system, `cs upgrade` decoded uv's UTF-8 output
+  with the locale codec. The decode error killed the upgrade mid-install and
+  left `cs` failing with `ModuleNotFoundError`, taking the status line with
+  it. Upgrade output is now captured as bytes, and uv runs with
+  `PYTHONUTF8=1`
+  ([#66](https://github.com/leeguooooo/claude-code-usage-bar/issues/66)).
+- If an upgrade fails and `cs` no longer runs, both `cs upgrade` and the
+  daily background upgrade retry once. If `cs` is still broken, `cs upgrade`
+  says so and prints the repair command, instead of a plain "Upgrade failed".
+- The other text-mode subprocess reads (`ocs whoami`, git status, …) decode
+  as UTF-8 with replacement, so a non-ASCII session name or path can't crash
+  them either.
+
+---
+
+## v3.43.5 — 2026-09-29
+
+**The ocs address line shows up on Windows.**
+
+- `find_ocs()` only looked for a file named exactly `ocs`, so on Windows,
+  where the binary is `ocs.exe`, the segment stayed hidden with no error. It
+  now tries the PATHEXT extensions (`.exe`, `.cmd`, …) on PATH and in
+  `~/.local/bin`, and skips an extensionless `ocs` there since Windows can't
+  run it ([#65](https://github.com/leeguooooo/claude-code-usage-bar/issues/65)).
+
+---
+
+## v3.43.4 — 2026-09-29
+
+**The Windows installer installs uv for you instead of stopping.**
+
+- `install.ps1` used to stop with `uv not found` when uv was missing. It now
+  installs uv with winget (built into Windows 10/11), reloads PATH in the same
+  window and carries on. It still never runs a remote install script; only
+  without winget does it stop and print install hints
+  ([#64](https://github.com/leeguooooo/claude-code-usage-bar/pull/64)).
+
+---
+
+## v3.43.3 — 2026-09-28
+
+**`cs` works on Windows, with a PowerShell one-liner to install it.**
+
+- Claude Code runs `cs render` with piped stdio, which on Windows defaults to
+  the ANSI code page (cp1252), so every render crashed with
+  `UnicodeEncodeError` on the first glyph. stdin/stdout/stderr are now switched
+  to UTF-8 on Windows; `cs doctor` and non-ASCII paths in the payload work too
+  ([#60](https://github.com/leeguooooo/claude-code-usage-bar/pull/60)).
+- New Windows installer: `irm https://raw.githubusercontent.com/leeguooooo/claude-code-usage-bar/main/install.ps1 | iex`
+  installs uv if missing, installs `claude-statusbar` as a uv tool (no Python or
+  admin needed), puts it on PATH and runs `cs --setup`. Re-run to upgrade
+  ([#61](https://github.com/leeguooooo/claude-code-usage-bar/pull/61)).
+- Thanks [@bpavlina](https://github.com/bpavlina) for both.
+
+---
+
+## v3.43.2 — 2026-09-16
+
+**Two Claude Code profiles no longer share one usage bucket.**
+
+- A second profile launched with `CLAUDE_CONFIG_DIR` has its own login, but the
+  account uuid was always read from `~/.claude.json`, so both profiles resolved
+  to the default account and shared one `rate_latest` bucket — whichever session
+  rendered last set the 5h/7d figures for both bars. The config dir now comes
+  from the session's `transcript_path` (which is also correct inside the daemon,
+  where one process renders many sessions), and is carried through the
+  reconcile, forecast and projection stores plus the 1s result cache.
+  Thanks [@kossolax](https://github.com/kossolax) for the report and the fix
+  ([#54](https://github.com/leeguooooo/claude-code-usage-bar/issues/54),
+  [#55](https://github.com/leeguooooo/claude-code-usage-bar/pull/55)).
+- Follow-up: the default profile keeps its transcripts in `~/.claude/` but its
+  login *beside* that dir at `~/.claude.json`, unlike a `CLAUDE_CONFIG_DIR`
+  profile which keeps both inside. The login is now looked up in both places, so
+  ordinary single-profile users keep their per-account store instead of falling
+  back to the legacy shared one.
+
+---
+
+## v3.43.1 — 2026-09-13
+
+**The ocs address gets its own line.**
+
+- `ocs boss · claude-7d5a5d07` (`show_ocs`) now always renders on its own line
+  instead of trailing the branch line — it's an address other agents copy, not
+  branch info, and it no longer crowds the project/branch line.
+- Verified with the real ocs 0.5.0: after `ocs rename`, the new name reached the
+  status line within ~17s (cache TTL 30s).
+
+---
+
+## v3.43.0 — 2026-09-13
+
+**ocs address on the branch line, so other agents can find this session.**
+
+- New segment `ocs boss · claude-7d5a5d07` (`show_ocs`, on by default): this
+  session's [open-cross-session](https://github.com/leeguooooo/open-cross-session)
+  name (from `ocs rename`) and stable id — both work with `ocs dm` / `@`. Without
+  a name it shows just the id; when ocs reports no id it falls back to the
+  session address.
+- Appears only when ocs ≥ 0.5.0 is installed (PATH or `~/.local/bin/ocs`) and
+  knows the session; otherwise hidden with no cost beyond a PATH lookup.
+- Uses only `ocs whoami --json --session <id>`, run in the background (daemon
+  thread pool / detached subprocess) and cached per session for 30s — the
+  render never waits on ocs, and a rename shows up within half a minute.
+  Output is sanitized (printable, ≤64 chars) before it reaches the terminal.
+- Turn it off with `cs config set show_ocs false`.
+
+---
+
+## v3.40.1 — 2026-08-26
+
+**A binary install asks GitHub whether it's current, not PyPI.**
+
+The standalone binary is downloaded from GitHub Releases, but the version
+check queried PyPI — the wrong service, and a slow one: PyPI's JSON index
+updates asynchronously after an upload, so for a minute or two after every
+release `cs upgrade` answered with the version it had just replaced. That
+happened five times in one afternoon, twice sending a maintainer looking for
+a bug that wasn't there. The v3.35.x cache-buster only defeated the CDN edge,
+not PyPI's own indexing delay.
+
+Frozen installs now read `releases/latest` from the GitHub API and fall back
+to PyPI if that fails; pip / uv / pipx installs still ask PyPI, which is
+correctly *their* channel.
+
+---
+
+## v3.40.0 — 2026-08-26
+
+**`⑂` is the default glyph now — the one that can actually take your theme color.**
+
+v3.38.0 made the marker 🌲 because a worktree is a tree. v3.39.0 found the
+flaw: an emoji is drawn by the emoji font in the font's own colors, so the
+theme's worktree hue (and `color_worktree`) reached only the text beside it,
+never the glyph — in a marker whose entire premise was "the worktree needs a
+color". The default is now `⑂` (OCR fork): one cell instead of two, VCS-native,
+and it takes the hue like everything else on the line.
+
+The tree is still one `cs config set worktree_glyph 🌲` away, along with `⋔`,
+`├`, `⧉`, or anything else that fits in two terminal cells.
+
+Anyone who had already set `worktree_glyph` keeps their choice — the config
+stores only what you changed, so this new default reaches exactly the people
+who never expressed a preference.
+
+---
+
+## v3.39.0 — 2026-08-26
+
+**Pick your own worktree glyph — because 🌲 can't take your theme's color.**
+
+An emoji is drawn by the emoji font in the font's own colors. `theme.wt` (and
+`color_worktree`) therefore reach only the text beside 🌲, never the glyph —
+which sits awkwardly with the reason the marker exists: the very first
+request for this feature was "the worktree needs a color". On the light themes
+(linen, sakura) the fixed emoji green is the wrong note entirely.
+
+`worktree_glyph` (default `🌲`) takes any 1-2 cell symbol:
+
+```
+cs config set worktree_glyph ⑂     # OCR fork — VCS-native, takes the theme color
+cs config set worktree_glyph ⋔     # pitchfork
+cs config set worktree_glyph ├     # file-tree feel
+cs config set worktree_glyph ⧉     # the pre-3.38 overlapping squares
+cs config set worktree_glyph 🌳    # a different tree
+```
+
+Anything wider than two terminal cells is refused at set time rather than
+quietly breaking the line's width budget.
+
+---
+
+## v3.38.0 — 2026-08-26
+
+**A tree, for the thing called a worktree.**
+
+The marker was `⧉` (overlapping squares) in a worktree and `⌂` (a house) in
+the main checkout — two glyphs, neither of which says "tree", for a feature
+whose whole subject is git *work trees*. Both are now 🌲, and the name after
+it says which tree you're standing in:
+
+```
+🌲 wt-party-slot (3)  ⤷ repo  ⎇ feature-branch    ← inside that worktree
+🌲 trunk (3)          ⤷ repo  ⎇ main              ← the main checkout, 3 worktrees exist
+🌲 trunk (0)          ⤷ repo  ⎇ main              ← no worktrees at all
+```
+
+`trunk` rather than `main`, so it never reads as a duplicate of a branch also
+called main. The worktree form keeps the full worktree hue; the trunk form
+stays dimmed, because standing in the trunk is the ordinary case.
+
+The glyph is two terminal cells wide, like the `⏰` the bar already uses; the
+width-aware clipping accounts for it.
+
+---
+
+## v3.37.1 — 2026-08-26
+
+**`⌂ (0)` — a repo with no worktrees says zero instead of saying nothing.**
+
+v3.37.0 showed the count only when there was one, which recreated the exact
+ambiguity it set out to remove: an absent marker and a count of zero look
+identical, so "is this broken or is it just zero?" is unanswerable from the
+bar. Every git checkout now carries the marker; only a non-git directory has
+none (it already says `(no git)`).
+
+---
+
+## v3.37.0 — 2026-08-26
+
+**The main checkout says how many worktrees are waiting, instead of saying nothing.**
+
+v3.33.0 put a `⧉` marker on linked worktrees and left the main checkout bare,
+on the reasoning that "you are in the main tree" is not news. But silence is
+also what a broken feature looks like: the same user asked three times why
+they couldn't see the worktree segment — each time from a main checkout, each
+time with the feature working exactly as designed.
+
+The main checkout of a repo that has linked worktrees now opens with a dimmed
+`⌂ (3)`: you are in the main tree, and three parallel checkouts exist. A repo
+with no worktrees still shows nothing, because there is nothing to say.
+
+```
+⧉ wt-party-slot (3)  ⤷ repo  ⎇ feature-branch      ← inside a worktree
+⌂ (3)                ⤷ repo  ⎇ main                ← the main checkout
+                     ⤷ repo  ⎇ main                ← a repo with no worktrees
+```
+
+Dimmed on purpose: being in the main tree is the ordinary case, and only the
+`⧉` form is a warning worth the full-hue treatment.
+
+---
+
+## v3.36.0 — 2026-08-25
+
+**The standalone binary keeps itself up to date now, like every other install.**
+
+Binary installs were the one channel excluded from the daily background
+upgrade: the rule was "never pipe curl|sh behind the user's back". Two things
+changed that calculus — the upgrade is now pinned to a specific release tag
+and verifies what actually landed (v3.35.4), so an unattended run can no
+longer leave a different build behind; and being excluded meant binary users
+sat on stale versions indefinitely, which is its own kind of harm.
+
+- Auto-upgrade runs once a day in a detached process, on every channel.
+- It still refuses when this copy doesn't own the `cs` on PATH — upgrading a
+  duplicate would hijack someone else's install (v3.35.2).
+- New `auto_upgrade` config key (default `true`) turns it off without an env
+  var: `cs config set auto_upgrade false`. `CLAUDE_STATUSBAR_NO_UPDATE=1`
+  still overrides everything.
+
+**The installer no longer deletes the bundle the upgrade is running from.**
+`prune_old_bundles` removed every previous onedir version on the assumption
+that nothing could still be inside one. An unattended upgrade *is* inside one,
+and a PyInstaller onedir binary dlopens its libraries lazily — pruning it
+mid-run could kill the upgrade in progress. The updater passes its own bundle
+in `CS_KEEP_BUNDLE_DIR`; the next upgrade collects it once it is empty.
+
+---
+
+## v3.35.4 — 2026-08-25
+
+**The upgrade now checks what it installed instead of announcing what it meant to.**
+
+v3.35.3 made `cs upgrade` run the installer. On its first real run the
+installer fetched from `releases/latest/download` — a pointer that lags for a
+while after publishing — and re-installed the version being upgraded *away
+from*, while `cs upgrade` reported "Upgraded to v3.35.3." Exit code 0, wrong
+binary, confident message.
+
+- The upgrade pins the download to the tag it decided on
+  (`releases/download/v<version>`), so it can't be handed a stale asset.
+- Afterwards it asks the installed `cs` for its version and compares. A
+  mismatch is reported as a failure that says which version actually landed,
+  not as success.
+- `install.sh` prints the version it just linked, so the same mistake is
+  visible from the outside too.
+
+---
+
+## v3.35.3 — 2026-08-25
+
+**`cs upgrade` now upgrades a standalone binary instead of describing how.**
+
+On a binary install the command printed the `curl … install.sh | bash` line and
+exited — a command named after an action it did not perform. Run it, check
+`cs --version`, and nothing had changed. The rule it was honoring ("never pipe
+curl|sh behind the user's back") is about *unattended* upgrades; typing
+`cs upgrade` is the consent that rule exists to protect. `auto_upgrade` still
+refuses to touch a frozen install, which is the case that actually runs
+unattended.
+
+- Up to date → says so and exits 0, without printing an install command you
+  don't need.
+- Newer release → runs the installer, streaming its output so you watch it
+  work, then tells you to restart Claude Code.
+- Version check failed → refuses to reinstall on the strength of an answer it
+  never got, and hands you the manual command.
+
+---
+
+## v3.35.2 — 2026-08-25
+
+**A leftover `uv` install can take over your binary install, silently.**
+
+Every installation channel puts its entry point at the same place —
+`~/.local/bin/cs`. A `uv tool install claude-statusbar` from months ago sits
+harmlessly behind a standalone binary until the day it auto-upgrades: uv then
+rewrites that symlink to its own copy, and `cs` is a different install than it
+was yesterday. Nothing announces it. Seen live on one machine — twice in ten
+minutes, the second time re-creating a copy that had just been uninstalled,
+because a still-running daemon from the old copy ran the upgrade.
+
+- **A copy that doesn't own `cs` no longer auto-upgrades.** It would be
+  upgrading itself into someone else's install. An explicit `cs upgrade` still
+  does what you ask.
+- **`cs doctor` lists duplicate installs** when it finds more than one, naming
+  each, because "whichever upgrades last wins" is not something you can debug
+  without being told it's happening.
+- **`install.sh` warns** when a uv/pipx copy is present and prints the exact
+  uninstall command. It does not remove another package manager's package on
+  its own.
+
+---
+
+## v3.35.1 — 2026-08-25
+
+**v3.35.0 handed the daemon to launchd; a render tick took it straight back.**
+
+`cs --setup` now kickstarts the service's own job — but one second later a
+status-line tick found the pidfile briefly free and lazy-spawned a competing
+daemon, which won it. launchd's instance exited 0 "already running" and stood
+down again, leaving the same unsupervised daemon v3.35.0 set out to fix. The
+lazy-spawn path now asks the service manager to start its job instead of
+racing it (falling back to a direct spawn only if the service manager refuses
+— an unsupervised daemon still beats no status bar).
+
+**Both shipped docs had a second copy that drifted.** `skills/` and `commands/`
+at the repo root (what GitHub and `npx skills add` serve) are separate files
+from `src/claude_statusbar/skills|commands/` (what the wheel and the binary
+install), with no sync step. The packaged SKILL.md had a dozen toggles the
+GitHub copy never mentioned; the packaged `statusbar-doctor.md` was still
+telling agents to fix a broken install with `pip install -U claude-statusbar`,
+which does nothing for a binary install. Both are back in sync, and a test now
+fails if they drift again.
+
+**Seven config keys were documented nowhere.** `show_cwd`, `show_ip_risk`,
+`show_fp_risk`, `show_balance`, `balance_bar`, `show_projection` and
+`color_worktree` existed only in the code and `docs/`; the skill an agent
+actually reads never mentioned them. Added.
+
+---
+
+## v3.35.0 — 2026-08-25
+
+**Three things that had been quietly wrong, all the same shape: the code
+couldn't tell your intent from its own staleness, so it froze — and blamed you.**
+
+**Slash commands and the skill were frozen at whatever version you installed
+first.** `install_skills` compared the file on disk to the *currently bundled*
+copy: shipping a newer SKILL.md looked exactly like a user edit, so it was
+kept — and the installer announced, every single upgrade, that it was
+preserving "your edited skill". One install sat at v3.5.0 for 29 releases,
+missing 13 config keys that had shipped since; the agent reading that skill
+had no idea `show_project_branch`, `show_ip_risk`, `api_mode` or
+`color_worktree` existed. The installer now records a checksum of everything
+it writes, so an upgrade can tell "we wrote this and you never touched it"
+(replace it) from "you edited this" (keep it). Files predating the manifest
+have unknown provenance: they are still kept, but the message says that
+plainly instead of asserting an edit you never made. `cs --setup --force`
+takes the shipped version.
+
+**A daemon with a LaunchAgent installed was running unsupervised.** Setup
+spawned its own detached daemon, which took the pidfile; launchd's own job
+then exited 0 and stood down — correct behavior for `KeepAlive:
+{SuccessfulExit: false}`, which exists to stop a restart loop. The result was
+a live daemon nothing would restart, while `cs daemon install` had promised
+exactly that. Setup now hands the process to the service manager
+(`launchctl kickstart -k` / `systemctl --user restart`) whenever one is
+installed, instead of racing it.
+
+**`cs doctor` printed a green ✓ next to "launchd state: not running".** It had
+two states, ✓ and ✗, so "working, but not the way it claims" had nowhere to
+go. There is now a third: a yellow `!` for exactly that case, naming the fix.
+
+Also: the PyPI version check appends a cache-buster. `pypi.org/pypi/<pkg>/json`
+sits behind a CDN that can serve a stale `info.version` for minutes after a
+release — long enough for `cs upgrade`, run right after publishing, to report
+the version it just replaced.
+
+---
+
+## v3.34.0 — 2026-08-25
+
+**Your config now stores only what you changed — so improved defaults actually reach you.**
+
+Every save used to dump all ~35 keys to JSON. One `cs config set style capsule`
+froze whatever the defaults happened to be that day, and every later change to
+a default was invisible to you forever. `show_project_branch` shipped default
+*off* and flipped to *on* hours later: anyone who wrote a config in that window
+kept the project/branch line hidden for months, with nothing in the file or the
+UI to explain why.
+
+- **Sparse storage.** Only values that differ from the default are written.
+  A key you never touched stays out of the file and keeps following the code,
+  so it moves when the default moves. Your existing file is rewritten on the
+  next `cs config set` — values are preserved exactly; only the redundant ones
+  disappear.
+- **`cs config unset <key>`.** The counterpart to `set`: drops a key so it
+  follows the default again. With sparse storage "no opinion" is finally a
+  state the file can express.
+- **`cs config show` says which is which.** Values that merely follow the
+  default are marked `(default)`; anything unmarked is a choice you stored. A
+  stale value can no longer masquerade as a default.
+
+Old full-dump config files keep working unchanged. Their stored values still
+win — a deliberate `false` and a frozen old default are indistinguishable, so
+nothing is guessed on your behalf; `cs config show` now makes them visible and
+`cs config unset` clears the ones you didn't mean.
+
+---
+
+## v3.33.1 — 2026-08-25
+
+**The standalone binary could not make a single HTTPS request — and said so nowhere.**
+
+PyInstaller bundles OpenSSL but not a certificate store, so the frozen `cs`
+looked for CAs at the *build runner's* compile-time path, which does not exist
+on any user machine. Every HTTPS call failed certificate verification, and
+since each call site swallows network errors, the failures were invisible:
+
+- `cs upgrade` answered "is up to date (per PyPI)" no matter how many releases
+  had shipped since.
+- The `↑<newver>` update hint never appeared for binary users.
+- The IP-risk probe cached nothing but `{"ok": false}`; relay-balance lookups
+  had the same fate.
+
+Fixed at the one place every invocation passes through — the frozen entry
+point now points `SSL_CERT_FILE` at a CA store that exists: certifi's bundle
+(now shipped inside the binary), falling back to the platform's system store.
+The `-m` self-spawns inherit it. An explicit `SSL_CERT_FILE` / `SSL_CERT_DIR`
+from the user is never overridden.
+
+And `cs upgrade` no longer reports an unreachable PyPI as good news — a check
+that never completed now says so, instead of claiming you are up to date.
+
+**If you are on a binary at v3.33.0 or older, `cs upgrade` cannot tell you
+about this release** — that is the bug. Re-run the installer once:
+
+```
+curl -fsSL https://raw.githubusercontent.com/leeguooooo/claude-code-usage-bar/main/install.sh | bash
+```
+
+pip / uv / pipx installs were never affected.
+
+---
+
+## v3.33.0 — 2026-08-25
+
+**The identity line now opens with the git worktree you're actually in.**
+
+A linked worktree used to render as a mute `[worktree]` tag tucked in after the
+branch — the same grey as the separators around it, i.e. invisible exactly when
+it mattered. It now *leads* the line, in a hue of its own, carrying the
+worktree's name and how many worktrees the repo has in total:
+
+```
+⧉ wt-party-slot (3)  ⤷ claude-code-usage-bar  ⎇ codex/party-status-slot-isolation ●
+```
+
+- **Its own color.** `Theme` gained a `wt` field, set per theme (violet on
+  graphite/dracula/catppuccin/tokyo-night, cyan on the already-purple twilight,
+  deep violet on the light linen/sakura, grey on mono). "This is not the main
+  checkout" is a different kind of fact from ok/warn/hot and must not be read as
+  a severity. Override with `cs config set color_worktree "#bd93f9"`.
+- **The name is read from disk, not from stdin.** Claude Code only sends
+  `workspace.git_worktree` for worktrees it created itself, so hand-made
+  `git worktree add` checkouts showed nothing. The name now comes from the
+  `gitdir:` path in the checkout's `.git` file, which is always there.
+- **`(3)` is the repo's worktree total**, counted from `.git/worktrees/`.
+  Entries whose checkout has been deleted but never pruned are excluded — a
+  number you can't trust is worse on a status line than no number.
+- **Less repetition.** A redundant repo prefix is trimmed
+  (`repo-wt-x` → `wt-x`), and a name that would only repeat the branch or the
+  repo collapses to a bare `⧉ worktree`.
+- **The repo stays the anchor.** Inside a worktree without a repo name on
+  stdin, the project used to render as the worktree's own directory name; it
+  now resolves to the main repo's name.
+
+Pure filesystem work — no `git` subprocess, ~0.3 ms per render.
+
+---
+
+## v3.32.5 — 2026-08-20
+
+**Fresh legacy `_MEI*` leftovers now age out automatically after upgrade.**
+
+The v3.32.4 installer safely skipped runtime directories younger than ten
+minutes, but its cleanup ran only once. The onedir daemon now retries the same
+fail-closed cleanup at startup and every 30 minutes, so directories that were
+too fresh during installation are removed after they become eligible.
+
+---
+
+## v3.32.4 — 2026-08-20
+
+**Standalone installs no longer leak PyInstaller `_MEI*` runtimes on every status refresh.**
+
+The macOS release binary included Python and PyObjC in PyInstaller onefile
+mode. `cs render` runs once per second, so each tick first extracted roughly
+11 MB into the user temp directory. A status-line timeout could kill the
+bootloader before its exit cleanup, leaving thousands of `_MEI*` directories
+and tens of gigabytes behind.
+
+- Release assets now contain a self-contained PyInstaller onedir bundle. The
+  CLI still needs no system Python, but the 1 Hz render path reuses the installed
+  runtime instead of extracting a new copy.
+- `install.sh` installs content-addressed versions below
+  `~/.local/lib/claude-statusbar`, atomically switches `~/.local/bin/cs`, starts
+  the new daemon, and removes superseded bundles only after setup succeeds.
+- After an onedir upgrade, the installer removes legacy `cs` `_MEI*` orphans.
+  Cleanup is macOS-only and fail-closed: it requires the old Python/PyObjC
+  signature, a ten-minute age, a leak cohort, current-user ownership, and an
+  `lsof` snapshot proving that no process has the directory open.
+
+**Windows: statusLine no longer written (or daily-reverted) to a shell-dead backslash path ([#42](https://github.com/leeguooooo/claude-code-usage-bar/issues/42)).**
+
+Claude Code executes the `statusLine` command through a POSIX shell (Git Bash on Windows), where `\` is an escape character — `C:\Users\me\cs.EXE` execs as `C:Usersmecs.EXE` and dies with exit 127 even though the file exists. `_resolve_cs_command()` returned `shutil.which()`'s backslash path verbatim, so on Windows the bar was broken from the very first write, and the daily self-heal reverted any hand-fix within 24h because it compared command strings for equality against that same poisoned path.
+
+- Paths are now written with forward slashes (valid in sh *and* cmd.exe), double-quoted when they contain spaces (double because cmd.exe has no single-quote semantics).
+- The daily self-heal now repairs only *broken* entries instead of anything that differs from today's canonical form: a working hand-fix, the fast/inline choice, and user-added CLI flags all survive. Repairs replace only the executable token — the argument tail is preserved verbatim (the old pass silently stripped flags like `--no-auto-update`). Bare `cs` is still upgraded to an absolute path once (GUI-launched Claude Code PATH gaps), and dead paths are still re-resolved.
+- Already-poisoned installs heal themselves on the next daily pass: a backslash executable is rewritten in place to forward slashes.
+- `cs doctor` gained a **statusLine shell test**: it runs the *configured* settings.json command string through `sh` — the render smoke test builds its own argv, which is exactly why this class of breakage stayed invisible. On Windows a backslash command is flagged statically.
+
+---
+
+## v3.32.3 — 2026-07-27
+
+**Installer polish — three papercuts visible on every re-install.**
+
+- `install.sh` ended with `bash: line 1: tmp: unbound variable`. The cleanup trap referenced a variable declared `local` inside the download function, so by the time the `EXIT` trap fired it was out of scope — which under `set -u` errored *and* meant the downloaded tarball's temp dir was never cleaned up. The scratch dir is now a global with a proper cleanup trap.
+- `cs --setup reported an issue` was printed on every re-install even when everything succeeded. Setup lumped "this file exists with your edits, so we kept it" — a benign, expected outcome when re-running the installer — into the same bucket as genuine copy failures. Skipped and failed are now separate, and only real failures affect the exit code. The status was also computed inside an `if verbose:` block, so the same run returned 0 quietly and 1 verbosely; it no longer depends on verbosity.
+- `cs hud` printed its install/uninstall/stop messages and errors in Chinese inside an otherwise English installer — leftovers from the v3.31.0 HUD English-ification.
+
+---
+
+## v3.32.2 — 2026-07-27
+
+**Fixes a crash that broke the status line for every standalone-binary user ([#36](https://github.com/leeguooooo/claude-code-usage-bar/issues/36)).**
+
+Once the daemon had run at least once, `cs render` died on *every* tick with `ValueError: max() iterable argument is empty` — the bar flashed and vanished in Claude Code. `_pkg_mtime()` scanned the package dir for `.py` files to detect a daemon running stale code, but a PyInstaller onefile build has none (modules live in the PYZ archive), so `max()` got an empty iterable and raised `ValueError`, which the `except OSError` guard did not catch. Affected every binary release (v3.30.0–v3.32.1); pip/uv installs were never affected.
+
+Frozen builds now use the executable's own mtime, so the stale-daemon detection keeps working there — re-running `install.sh` replaces the binary, which is exactly the "installed code is newer than the daemon" signal it needs.
+
+**`cs doctor` now actually renders.** It reported all-green while the status line was dead, because every check inspected state and none exercised the render path. It now runs a real `cs render` with your cached payload and prints the traceback when it crashes — this class of bug can't hide behind a green report again.
+
+Thanks to [@gasbasd](https://github.com/gasbasd) for a report that pinpointed the root cause, the trigger condition, and the fix.
+
+---
+
+## v3.32.1 — 2026-07-22
+
+**Patch: `cs --version` program name + test determinism.** `cs --version` now derives its program name from `basename(argv[0])` rather than argparse's `%(prog)s` — Python 3.14 rewrites `%(prog)s` to `python3.x -m module` under `-m`, which mangled the prefix. The three aliases (`cs` / `cstatus` / `claude-statusbar`) now each show their real name on every Python version. Also made `test_preview` deterministic by forcing the demo dataset instead of depending on the machine's cached stdin (which can legitimately have no warm cache or cost).
+
+---
+
+## v3.32.0 — 2026-07-22
+
+**One command installs everything.** The `curl … install.sh | bash` one-liner now sets up *both* surfaces on macOS: the terminal statusLine **and** the floating desktop HUD. The macOS binary bundles the HUD (PyObjC) — no `pip install 'claude-statusbar[hud]'`, no venv, no extra steps. When the installer detects the Claude desktop app it registers the HUD to auto-start on login, and it rides the binary's own auto-update like everything else. Linux binaries are unchanged (the HUD is macOS-only).
+
+---
+
+## v3.31.0 — 2026-07-22
+
+**Desktop HUD: channel jump + English UI.** Single-click an AgentParty channel in the `cs hud` panel to open a menu — **Open session in Claude** (`claude://resume?session=` deep link to the matching CLI session), **Open in AgentParty** (`agentparty://channel/…` deep link the AgentParty client handles), or **Pin to bar** (keep that channel on the collapsed pill). The HUD UI is now fully English.
+
+---
+
+## v3.30.0 — 2026-07-22
+
+### Zero-dependency standalone binary — install with no Python or pip
+
+`claude-statusbar` now ships as a self-contained `cs` binary attached to each
+GitHub Release, so people without Python can install in one line:
+
+```
+curl -fsSL https://raw.githubusercontent.com/leeguooooo/claude-code-usage-bar/main/install.sh | bash
+```
+
+The installer detects the platform (macOS arm64/x86_64, Linux x86_64), verifies
+a SHA-256 checksum, drops the binary in `~/.local/bin`, and runs `cs --setup`.
+Platforms without a prebuilt binary fall back to the pip installer. The pip /
+uv / pipx package is still fully supported and remains required for the desktop
+HUD (`cs hud`), which needs PyObjC.
+
+Under the hood the frozen binary emulates `python -m <module>` for its own
+background self-spawns (daemon, git / balance / IP-risk refresh), so daemon
+fast-mode behaves identically to a pip install. The updater is frozen-aware: a
+binary can't `pip`-upgrade itself, so `cs upgrade` points at the installer
+instead, and the background auto-update check is skipped.
+
+### Documentation
+
+The README was reorganized into a concise landing page with a Features overview
+and per-topic guides under `docs/`, and a Simplified Chinese translation
+(`README.zh-CN.md`) was added.
+
+---
+
+## v3.29.12 — 2026-07-15
+
+### AgentParty sessions now read their complete matching status slot
+
+v3.29.11 made the displayed AgentParty identity session-specific, but the
+channel, unread count, last-message preview, and listener state still came
+from the workspace's shared last-writer mirror. Two sessions in the same
+repository could therefore render a mixed line, such as one session's agent
+name beside another session's channel or stale-listener warning.
+
+The status bar now reproduces AgentParty's config-slot fingerprint and reads
+the complete cache entry owned by the session's explicit
+`AGENTPARTY_CONFIG`. It falls back to the legacy workspace mirror when no
+matching slot exists, preserving compatibility with older AgentParty clients.
+
+---
+
+## v3.29.11 — 2026-07-11
+
+### AgentParty identity is isolated per session, not per project directory
+
+Two Claude Code sessions in the same repository can use different
+`AGENTPARTY_CONFIG` files. The AgentParty cache itself is workspace-scoped, so
+the last writer previously made both status bars show the same agent name.
+The status bar now resolves the config used by each session's actual shell
+tool calls and overlays only that config's cached identity.
+
+Transcript parsing accepts real `tool_use` command records only. A later user
+or assistant message that merely quotes another valid config path cannot
+change the displayed identity. The bridge remains local-only: config tokens
+are never rendered, logged, or sent over the network.
+
+---
+
+## v3.29.10 — 2026-07-10
+
+### The legacy ⚠ chip is silenced by ANY projection, not just one with an ETA
+
+v3.29.8's dedup gate only hid the legacy average-pace countdown when the
+projection chip carried a depletion ETA. That left the contradictory case
+live: `→98% ⚠~25m` — the better model saying "you'll end under the cap"
+right next to the cruder one screaming "empty in 25 minutes". Whenever a
+usable projection exists it now wins outright; the ⚠ chip renders only when
+there is no projection to disagree with (projection disabled, or the
+early-window `→--` placeholder).
+
+---
+
+## v3.29.9 — 2026-07-10
+
+### Projection algorithm review — four fixes
+
+- **Snapshot throttling.** Every compute appended a backtest snapshot (0.4s
+  average gap live), so the 1000-entry cap covered 8.5 minutes of history —
+  useless for backtesting — while ~150KB of snapshots were re-parsed and
+  re-written by the daemon every second, its single largest CPU line. Now one
+  snapshot per window per 60s (~8h of history), and the store shrinks ~10x.
+- **Sample decimation.** Fractional-percent ticks stored a sample each
+  (2032 live); rate math reads the first/last of a ≥5-minute span, so
+  sub-0.5pp/sub-60s granularity was pure file weight. Skipped now.
+- **Burst rates clamp instead of vanishing.** A recent rate above the
+  sanity cap (60%/h for 5h) was discarded entirely, dropping the blend back to
+  the much slower window average at exactly the hottest moments — the
+  projection went LOW when it most needed to go high. It now pins at the cap.
+- **The →100%·ETA warning arrives minutes earlier.** The display smoother
+  eased toward a depleting raw projection over its full 8-minute tau, delaying
+  the warning. When the raw says ≥100% the approach is fast (τ=2min);
+  downward moves keep the slow tau, so cooldowns still don't flap.
+
+Known approximation, documented in code: the 7d depletion ETA inverts a
+bucket-integrated projection linearly and can overestimate time-left when
+near-term buckets are hotter than the tail.
+
+---
+
+## v3.29.8 — 2026-07-10
+
+### One countdown, not two
+
+v3.29.7's depletion ETA (`→100%·33m`, blended-rate) and the legacy
+average-pace forecast (`⚠~25m`) answer the same question with different
+estimators, and both rendered side by side — two disagreeing countdowns on one
+line. The legacy chip now yields whenever the projection carries an ETA, and
+remains the fallback for windows whose projection doesn't.
+
+---
+
+## v3.29.7 — 2026-07-10
+
+### A maxed projection now says WHEN the quota runs out
+
+`→100%` alone buried the useful half of the prediction. When the pace
+overshoots the cap, the chip now carries the estimated time until usage
+actually hits 100%: `5h[▓ 27%] 🕐4h19m →100%·1h12m` reads "headed to the cap,
+empty in about an hour". Computed from the same blended-rate projection
+(unclamped twin), only shown when depletion lands before the window reset.
+
+### Quiet channels no longer read as "listener down"
+
+AgentParty CLIs older than 0.2.80 heartbeat only when traffic arrives, so a
+listener on a quiet channel went heartbeat-stale after 10 minutes and the bar
+showed `⊘ listener down` while the process sat healthily connected (seen live:
+a serve alive with a 32-minute-old heartbeat). The process is the better
+witness: alive and verifiably a `party` process → `◉ watching/serving`,
+whatever the heartbeat age. A recycled PID (alive but not a party process)
+still reads as down. Upstream, AgentParty 0.2.83 also heartbeats on a 60s
+timer and an exiting `watch --once` no longer wipes another live listener's
+record.
+
+---
+
+## v3.29.6 — 2026-07-10
+
+### Documentation
+
+- **Clarified Claude Code vs Codex support.** The README now has an explicit
+  support matrix: Claude Code remains the full native `statusLine` integration
+  for quota/session/context/cache/activity data, while Codex support is the
+  local AgentParty bridge that shows channel, identity, listener state, unread
+  count, and last-message preview from
+  `~/.agentparty/state/<workspaceId>/statusline.json`.
+- **Updated the latest-release summary.** The top of the README now points to
+  v3.29.6 and summarizes the v3.29.5 daemon/session fixes instead of leaving an
+  older v3.28.x entry first.
+
+## v3.29.5 — 2026-07-09
+
+### launchd/systemd daemons were unkillable — and immune to upgrades
+
+`_process_is_our_daemon` matched the module path `claude_statusbar`
+(underscore), which only appears in lazy-spawned daemons
+(`python -m claude_statusbar.cli …`). A service-managed daemon's cmdline is
+`<venv python3> /path/to/cs daemon _run` — no underscore form anywhere. So for
+every launchd/systemd instance:
+
+- `cs daemon stop` refused with a false "PID reused. Refusing to SIGTERM".
+- The upgrade drift-kill (guarded since v3.29.1) also refused — the stale
+  daemon kept serving old code after every upgrade.
+
+The matcher now recognizes all spawn shapes, keyed on the shared
+`daemon _run` invocation.
+
+### The AgentParty line showed in sessions that never joined
+
+The AgentParty cache is cwd-scoped by contract, but Claude Code sessions are
+not: several windows share one project directory and only some of them join a
+channel (typically with a per-session `AGENTPARTY_CONFIG`). Every window in
+the directory rendered whichever session's channel/identity wrote the cache
+last — dead listeners and all.
+
+The env var never reaches the Claude Code process (agents export it inside
+individual Bash calls), so the line is now gated on the only session-scoped
+evidence there is: the session's own transcript. A window shows the party
+block only after its transcript contains a party command
+(`party init/send/watch/…` or `AGENTPARTY_CONFIG`). Scans are incremental
+(byte offset per session, sticky verdict), so a large transcript is read once
+and each later render reads only the appended tail. Sessions without a
+transcript (preview, tests, bare `cs`) keep the old always-show behavior.
+
+### An exiting daemon could delete the current owner's pidfile
+
+`flock` locks an inode, not a path: after an unlink+recreate cycle, two daemons
+each hold "the" lock on different inodes. `_release_pidfile` unlinked by path
+unconditionally, so the exiting daemon deleted the pidfile the *current* owner
+had just written — making it invisible to stop/status/spawn_if_dead, so the
+next render spawned a duplicate. Observed live twice in one day (a pidfile-less
+daemon looping for 15+ minutes beside a fresh one). Release now unlinks the
+locked file only while it still points at the exiting daemon's own inode.
+
+---
+
+## v3.29.4 — 2026-07-09
+
+### The daemon's auto-upgrade silently failed under launchd/systemd
+
+launchd and systemd run the daemon with the bare system PATH, which lacks
+`~/.local/bin` — where uv and pipx actually live. `shutil.which("uv")` failed
+there, so the upgrade fell through to `python -m pip install --upgrade` — and a
+uv tool venv ships **without pip**. Net effect: for uv installs whose daemon
+runs as an OS service, the daily auto-upgrade has never worked. Tool discovery
+now searches well-known directories (`~/.local/bin`, `~/.cargo/bin`, Homebrew)
+after PATH.
+
+### `cs upgrade` is now the one documented upgrade path
+
+Users kept being told (by READMEs and by agents guessing) to run
+`uv tool install …` — and many of them don't have uv, because they installed
+via pip. `cs upgrade` has picked the right channel since 3.28.1; now every
+surface says so: the README's Upgrading section, the claude-statusbar skill's
+decision tree (with an explicit "never guess a package-manager command" note),
+its trigger words (`upgrade`/`update`/`升级`), and `/statusbar-doctor`'s
+follow-up suggestions.
+
+---
+
+## v3.29.3 — 2026-07-09
+
+### The systemd unit had the same respawn loop v3.29.2 fixed on launchd
+
+v3.29.2 changed the launchd plist to `KeepAlive: {SuccessfulExit: false}` but
+left the systemd user unit at `Restart=always` — which relaunches even a clean
+exit. On Linux, whenever a lazy-spawned daemon held the pidfile, systemd's own
+instance exited 0 and was rerun every `RestartSec=5`, forever (and v3.29.2's
+exit-0 change made the loop *silent*). `cs daemon stop` also never stuck: clean
+exit, immediate relaunch. Now `Restart=on-failure` — crashes still bounce.
+Linux installs need `cs daemon install` re-run.
+
+### `mentions_only` now comes from the AgentParty contract, not `ps`
+
+AgentParty 0.2.79 writes `listener.mentions_only` into `statusline.json`
+(contract change shipped alongside this release). The statusbar reads it
+verbatim; the `ps` argv probe remains only as a fallback for older CLIs. This
+removes the last per-render fork on up-to-date installs and closes the
+pid-recycling staleness the memoised probe could serve.
+
+---
+
+## v3.29.2 — 2026-07-09
+
+### launchd was respawning a redundant daemon every 10 seconds
+
+The LaunchAgent shipped `KeepAlive: true`, which restarts the job on *any*
+exit. Whenever the thin client's lazy-spawn already owned the pidfile,
+launchd's own `cs daemon _run` found it taken, printed `daemon already
+running`, exited 1, and was relaunched `ThrottleInterval` seconds later —
+forever. A live `daemon.stderr.log` had **47429** such lines.
+
+`run_forever` now exits **0** when another daemon holds the pidfile (a daemon
+is running; this process's purpose is served), and the plist uses
+`KeepAlive: {SuccessfulExit: false}` so a clean exit ends the respawn while a
+real crash still bounces the daemon.
+
+Existing installs need `cs daemon install` re-run to pick up the new plist.
+
+### The test suite was writing into the user's real daemon log
+
+`test_render_payload_signal_alarm_aborts_slow_render` sets `RENDER_TIMEOUT_S`
+to 1 and lets a render time out, but `_log()` writes to the real
+`~/.cache/claude-statusbar/daemon.log`. Every `pytest` run appended a
+`render timed out after 1s` line there; **260** had accumulated, and they
+masked the daemon's genuine timeouts (logged as `after 12s`, none since
+2026-06-03). Diagnosing a "slow render" from that log meant reading test
+output as production signal. The test now stubs `_log`.
+
+### Warm renders are ~2.5x faster
+
+v3.29.0's `--mentions-only` probe forked `ps` on **every** render — about 4ms
+of a 6ms warm render. A process's argv never changes, so it is memoised per
+pid. Warm render: ~6.1ms → ~2.4ms.
+
+---
+
+## v3.29.1 — 2026-07-09
+
+### The daemon was crash-looping on slow renders
+
+`run_forever`'s sleep loop read the clock twice:
+
+```python
+end = time.time() + sleep_for
+while _running and time.time() < end:
+    time.sleep(min(0.2, end - time.time()))   # <- second read
+```
+
+If the process was descheduled between the guard and the subtraction, the
+remainder had already elapsed, `time.sleep()` got a negative number and raised
+`ValueError: sleep length must be non-negative`. The daemon died. Any render
+slower than the tick interval — the `render timed out after 1s` lines in
+`daemon.log` — made the window wide enough to hit routinely.
+
+This is the root cause behind v3.29.0's third fix. The orphan-`.tmp` sweep and
+the auto-update check were not merely starved by sharing a 30-minute timer; the
+daemon was being killed long before it could reach 30 minutes, then restarted by
+launchd. The remainder is now clamped at zero.
+
+---
+
+## v3.29.0 — 2026-07-09
+
+### AgentParty block redesign
+
+The AgentParty line answered none of the questions it existed to answer.
+
+- **`watch down` was a lie.** The statusline contract writes the listener
+  heartbeat as `heartbeat_ts`; `party.py` read `heartbeat_at`. It always got
+  `None`, so the heartbeat never looked fresh and *every live listener rendered
+  as `down`*. Two test fixtures wrote `heartbeat_at` too, so the bug was pinned
+  in place by its own tests.
+- **It was unreadable.** The whole line stacked the `FAINT` attribute on top of
+  the theme's dimmest grey. Colour is now assigned by meaning: channel in `ink`,
+  identity in `mute`, listening state green/red/grey, unread count amber.
+- **The message no longer crowds the header.** It gets its own line, clipped to
+  54 display columns with wide CJK glyphs counted as two, so a long preview
+  cannot push the header off screen.
+- **The listening state is stated outright** — `◉ watching` / `◉ serving`
+  (green), `⊘ listener down` (red), `◌ not listening` (grey, no listener
+  attached). `@mentions` is appended when the live listener runs with
+  `--mentions-only`, detected from its argv.
+- **The message carries its own state**: `●` unread / `○` read, followed by `@`
+  when the preview mentions your identity. Mention matching is exact, so
+  `@leo-zego-im` does not mark `leo-zego`. (The writer clips previews at 48
+  chars, so a mention past that cut is missed — it under-reports, never
+  over-reports.)
+- Emoji gave way to monochrome geometry (`⬡` agent, `⬢` human). Glyphs now
+  inherit the theme colour and hold a single column.
+
+### Daemon restart fixes
+
+Found while investigating "I upgraded but nothing changed".
+
+- **The code-drift tick burned its own spawn debounce.** On detecting drift the
+  thin client SIGTERMed the old daemon and immediately called
+  `_spawn_daemon_async()`. The old daemon was still alive handling the signal,
+  so `spawn_if_dead` found a valid pidfile and refused — after the 30s debounce
+  marker had already been stamped. Every session then inline-rendered for 30
+  seconds. The drift tick no longer spawns; the next tick (~1s) does.
+- **`_signal_outdated_daemon` could SIGTERM an unrelated process.** A session's
+  meta outlives the daemon that wrote it, so `meta["pid"]` may have been
+  recycled. It now verifies `_process_is_our_daemon(pid)` first — the guard that
+  the function's own docstring already claimed to apply.
+- **The orphan-`.tmp` sweep and the auto-update check were starved.** Both hung
+  off the session-GC timer, which is seeded to daemon start and fires after 30
+  minutes. Since the thin client restarts the daemon on every code drift, it
+  rarely lived that long and neither ever ran. Observed live: 15 orphaned `.tmp`
+  files, the oldest 99 minutes old, against a 60-minute cutoff. Maintenance now
+  runs on the first tick; session GC keeps its deferral.
+
+---
+
+## v3.28.2 — 2026-07-09
+
+### Fixed
+- **`cs upgrade` detects uv-tool installs correctly.** uv tool environments
+  symlink `bin/python3` to the shared uv Python install; the upgrade detector now
+  checks the original executable path and environment prefix before falling back
+  to the resolved Python path, so `cs upgrade` selects
+  `uv tool install --upgrade claude-statusbar` instead of a non-working venv pip.
+
+## v3.28.1 — 2026-07-09
+
+### Added
+- **Foreground upgrade command.** `cs upgrade` now upgrades the install channel
+  that is actually running `cs` (`uv tool`, `pipx`, or plain `pip`), which avoids
+  the confusing case where `pip install -U claude-statusbar` updates a different
+  Python environment than the `cs` shim on `PATH`.
+- **Version aliases.** `cs -v`, `cs -V`, and `cs -version` now behave like
+  `cs --version`.
+
+## v3.28.0 — 2026-07-09
+
+### Added
+- **AgentParty / Codex bridge line (`show_party`, default on).** When the same
+  workspace has an AgentParty local status cache, the bar appends a local-only
+  line such as `🎈 #agentparty · 🤖 xdream-agent · 👂serve · 3 unread · bob:
+  shipped the auth patch 2m`. This is designed for Codex + AgentParty workflows:
+  the writer side runs in AgentParty, while `cs` only reads
+  `~/.agentparty/state/<workspaceId>/statusline.json`.
+- **Shared workspace id contract.** The reader matches AgentParty's cwd-scoped
+  `workspaceId` algorithm and has fixture tests for macOS `/tmp` behavior, so
+  Codex/AgentParty and Claude Code renders point at the same local state file.
+
+### Changed
+- **Documentation now separates Claude Code and Codex support.** Claude Code
+  remains the full native `statusLine` data source for quota/session fields;
+  Codex support is the local AgentParty presence/channel/unread bridge and does
+  not make network requests or read AgentParty tokens.
+
+### Fixed
+- **Stale listener state degrades visibly.** If the AgentParty cache is older
+  than 10 minutes, or the recorded listener pid is gone, the appended line marks
+  `stale` / `down` instead of showing a live listener.
+
+## v3.27.0 — 2026-07-03
+
+IP-risk detection re-synced with the ip-check.leeguoo.com service (this module
+mirrors its `classify` + `claude-verdict`); both diverged and are now aligned.
+
+### Added
+- **China-cloud detection.** Claude account-risk systems flag Chinese clouds
+  (Alibaba/Aliyun, Tencent/QCloud, Huawei, ByteDance/Volcengine, Baidu, UCloud,
+  Kingsoft…) by provider **org/ASN**, not by where the IP geolocates — so a
+  Chinese cloud's *US* node still counts. The local scorer now detects these by
+  org keyword and ASN, adds a +25 risk weight on top of hosting (33 → 58, 中度;
+  worse than a neutral AWS-US datacenter at 60), and exposes a `china_cloud`
+  flag. A CN-registered but non-hosting org (a normal residential ISP) is *not*
+  misclassified as a cloud. This is the most relevant signal for the tool's
+  audience — users on a Chinese cloud's overseas node — which was previously
+  scored as an ordinary datacenter and let through.
+
+### Fixed
+- **Ban-risk threshold aligned with the crit band.** `verdict()` treated
+  `risk >= 67` as ban-risk while `classify()`'s crit band is `risk >= 70`, so
+  scores 67–69 on a non-anonymizer type read as ban-risk in one place and only
+  中度 in the other. Both now use 70 (matching the ip-check service fix).
+
+## v3.26.0 — 2026-07-03
+
+Community issue sweep — all four open issues fixed (#29 #30 #31 #32).
+
+### Fixed
+- **Windows: `cs doctor` / `cs --setup` false-positive "not ours" (#32).**
+  `shutil.which("cs")` on Windows resolves to `cs.EXE`; the basename never
+  exact-matched our command names, so setup refused to configure and doctor
+  always flagged a foreign statusLine. Command basenames are now lowercased
+  and stripped of the pip/pipx shim extensions (`.exe`/`.cmd`/`.bat`) before
+  matching. Foreign tools ending in `.exe` are still refused.
+- **Windows: unbounded daemon process leak (#31).** The old no-`fcntl`
+  fallback always returned True ("honor system"), so every stale render tick
+  spawned another daemon (~150 orphans/day reported). Three defenses now:
+  a real `msvcrt.locking` exclusive lock on a separate `daemon.lock`
+  sentinel (locking `daemon.pid` itself would blind `stop`/`status` —
+  Windows byte locks are mandatory), a ctypes `OpenProcess` liveness probe
+  (`os.kill(pid, 0)` on Windows *terminates* the target), and a 30s spawn
+  debounce in the thin client so even a broken lock leaks at most one
+  short-lived process per 30s. *Not yet verified on real Windows — feedback
+  welcome on #31.*
+
+### Added
+- **`CLAUDE_CODE_AUTO_COMPACT_WINDOW` / `CLAUDE_CODE_DISABLE_1M_CONTEXT`
+  respected for the ctx gauge (#29).** Users who raise the context window
+  (e.g. `400000`) no longer see ctx% computed against the stock window;
+  a truthy `CLAUDE_CODE_DISABLE_1M_CONTEXT` caps a >200K reported window
+  back to 200K. Empty/invalid values keep current behavior.
+- **`show_cwd` toggle (#30).** Opt-in working-directory segment (default
+  off) rendered from stdin's `workspace.current_dir` — zero extra I/O.
+  `cwd_style` chooses `basename` (default) or `full`; the segment is
+  skipped when it would just repeat the project name.
+
+## v3.18.0 — 2026-06-29
+
+### Added
+- **Stale-quota hint instead of silently blank 5h/7d bars.** When the statusLine
+  pipeline stops feeding cs (another tool displaced the statusLine, or the daemon
+  died) the cached 5h/7d windows expire and the expiry guard hid both bars —
+  indistinguishable from a fresh session, so it just looked *broken*. The bar now
+  shows `⟳ 5h/7d stale·restart` (yellow) in that exact case, telling you it's
+  stale and a restart refreshes it. Gated tightly: only fires when the client
+  emits rate_limits, an assistant turn already exists (a healthy session would
+  have data by then), and the quota cache is genuinely all-expired — so a real
+  session-start still shows the normal `--%` placeholders, never a false alarm.
+- **`cs doctor` now reports 5h/7d quota-cache freshness** — `fresh` / `empty` /
+  `stale (last update Nh ago … restart Claude Code; if it persists another tool
+  took the statusLine → cs --setup)`. Turns the cache-file archaeology a user
+  otherwise had to do into one diagnostic line.
+
+## v3.17.0 — 2026-06-29
+
+### Added
+- **Balance fuel-gauge battery (`balance_bar`, default on).** The relay balance
+  now renders as a battery bar — `bal[████ 52%] $26.00` — where the fill is the
+  **remaining** proportion (a fuel/phone-battery mental model: full = green,
+  getting low = yellow ≤25%, nearly empty = red ≤10%), with the remaining amount
+  trailing. So you see both how much is left (the gauge + %) and the absolute
+  figure at a glance. Falls back to the plain `bal $X` text when the relay
+  reports no usable hard-limit (some relays return a sentinel/zero limit, which
+  would make a gauge misleading). Turn the bar off with
+  `cs config set balance_bar false` to keep the plain text.
+- **`.claude-plugin` marketplace/plugin manifests re-synced to 3.16.0** — they
+  were left at 3.15.1 by the v3.16.0 release (PyPI package was correct).
+
+## v3.16.0 — 2026-06-29
+
+### Added
+- **Relay account balance in no-quota mode (`show_balance`, default on, auto).**
+  When you're on a third-party relay / API key (no official 5h/7d quota), the bar
+  can now show `bal $X.XX` — your remaining relay balance. A detached helper
+  probes the relay's OpenAI-compatible billing endpoint
+  (`/dashboard/billing/subscription` + `/usage`, the new-api / one-api de-facto
+  standard) with your key, computes `hard_limit − used/100`, and caches it 5 min
+  (a relay that 404s is remembered as unsupported for 1 h, so we don't re-probe
+  every render). Fully automatic: **shown only if the relay actually answers,
+  silently hidden otherwise** — subscribers and unsupported relays see nothing,
+  zero config. The probe always runs in a separate process (like the git
+  dirty-state refresh), so it never blocks the bar; the default `Python-urllib`
+  User-Agent is replaced because some Cloudflare-fronted gateways 403 it. Turn
+  off with `cs config set show_balance false`.
+
+---
+
+## v3.15.1 — 2026-06-29
+
+### Fixed
+- **`git status` refresh no longer strands `.git/index.lock`.** The background
+  dirty-state poll now runs with `--no-optional-locks`, so a slow repo hitting
+  the 2 s timeout (and getting killed) can't leave a stale lock that blocks your
+  own next `git add` / `commit` / `rebase`.
+- **`cs config set warning_threshold` / `critical_threshold` now actually
+  affect the bar.** The render path hardcoded 30/70 and never read the saved
+  config; severity thresholds now resolve **CLI flag → env → config → default**.
+- **Context-window colour is consistent across modes.** The model name's
+  context-fill colour now uses the 70/85 context band (not the 30/70 comfort
+  band), so ~35% context reads calm green instead of a false yellow in quota
+  mode — matching the no-quota `ctx[…]` bar. Applied to all three styles.
+- **Per-session no-quota detection under the shared daemon.** Relay /
+  `CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX` env signals are now read
+  per session (stamped by the thin client into the payload) instead of the
+  daemon's frozen start-time `os.environ`, fixing mis-detection when sessions
+  with different backends share one daemon.
+- Concurrent `git status` cache writes use a unique temp file (no more
+  cross-write corruption / 30 s freeze); the reset-time exception fallback
+  returns `--` instead of a wrong "next 2 PM (local)" estimate.
+
+### Changed
+- Removed the orphaned claude-monitor cache subsystem (`try_original_analysis`,
+  `direct_data_analysis`, `cache_refresh.py`, and the `cache.py`
+  `read_cache`/`write_cache`/`refresh_cache_background` trio) — all dead code.
+  The displayed `$` figure comes from Claude Code's own `session_cost_usd`, so
+  no local token pricing is needed. Net −430 lines, no behaviour change.
+
+---
+
+## v3.15.0 — 2026-06-22
+
+### Added
+- **No-quota mode for third-party relays / Bedrock / Vertex.** When Claude Code
+  points at a relay (`ANTHROPIC_BASE_URL` ≠ `api.anthropic.com`) or a cloud
+  backend (`CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX`), Anthropic's
+  official 5h/7d quota doesn't exist — so the bar now drops the two quota
+  battery bars and **promotes the context window to its own `ctx[…]` battery
+  bar** (green→yellow→red on 70/85% used), keeping the model name, prompt-cache
+  countdown, and live-activity tail. Previously the bar showed empty quota bars
+  or, worse, back-filled a previous official session's cached quota as fake
+  current numbers. Implemented for all three styles (classic / capsule /
+  hairline); inspired by [claude-hud](https://github.com/jarrodwatts/claude-hud).
+- Detection is automatic (`api_mode = auto`, the default), with a transcript
+  heuristic (gated on a Claude Code version that emits rate_limits, so old-client
+  official users aren't misread) as a fallback when the env var doesn't reach the
+  statusLine subprocess. Force with `cs config set api_mode on` or `CS_API_MODE=on`;
+  disable with `api_mode off`. Works under both the inline and daemon render paths.
+
+---
+
+## v3.14.1 — 2026-06-16
+
+### Changed
+- **Projection coloring red line lowered to 85% (yellow now 70–84%, green
+  below 70%).** A 7d window projecting `→99%` was showing yellow because red
+  only started at the cap (100%) — but the `→NN%` chip is clamped to 100 and
+  the slow 7d window can sit at 99% for a long time, so "basically going to run
+  out" was reading as merely warm. Red now starts at 85%, where a projection is
+  effectively a sure exhaustion. The `→NN%` chip itself now uses the same
+  red/yellow lines as the bar so they never disagree.
+
+---
+
+## v3.14.0 — 2026-06-16
+
+### Changed
+- **Rate-limit windows (5h/7d) now color by where usage is HEADED, not where it
+  is right now.** Once a `→NN%` end-of-window projection exists, the window's
+  bar fill, label, and ⏰ clock take a severity from the *projected* value
+  against the cap: green below 80%, yellow 80–99%, red at 100%. The bar's fill
+  LENGTH and printed % still track current usage — only the color is projected.
+  So a 7d window sitting at 24% but on track for →96% now reads yellow instead
+  of a falsely-healthy green. Applies to all three styles (classic bar, capsule
+  `●` dot, hairline mini-bar). Before a projection exists, the window falls back
+  to current-usage coloring on the configured thresholds (unchanged).
+
+### Fixed
+- **The `→NN%` projection no longer reads far too low for the first ~15 minutes
+  after a window resets.** The smoother was seeded from the `used=0` first
+  post-reset tick (where the raw projection collapses to the bucket prior ~2%),
+  then crawled up with an 8-minute time-constant — so a 5h window 6 minutes in
+  at 1% used showed `→14%` when the pace already implied ~50%+. The projection
+  now holds the `→--` placeholder until `MIN_ELAPSED` (5h=10m, 7d=1h) — the same
+  floor the ⚡ETA chip already uses — and then seeds from the first trustworthy
+  reading (no lag). During the hold the window colors by current usage, an
+  honest "not enough signal yet" instead of a fake-precise low number.
+
+---
+
+## v3.13.7 — 2026-06-12
+
+### Fixed
+- **Parallel sessions logged into different Claude accounts no longer
+  cross-contaminate the 5h/7d display.** The statusline stdin blob does not
+  identify which account produced it, so with multiple accounts running
+  side-by-side, ALL sessions wrote into the current login's shared store — and
+  the "later resets_at wins" merge let another account's 7d window mask the
+  real one with no heal path (live incident: bar showed the other account's
+  7d 14% while `/usage` said 77%). A reading's identity is now
+  `(window, resets_at)`: the shared store keeps per-reset buckets, each render
+  is answered from the bucket matching its OWN blob's reset, and all
+  v3.13.3–v3.13.5 healing rules (monotonic merge, confirmation grace,
+  re-baseline acceptance) apply unchanged within a bucket. Legacy store
+  schemas migrate automatically.
+- **`→NN%` projections were artificially conservative during heavy use.**
+  Three stacked causes: (1) the cross-account bug above also starved the real
+  window's projection samples (samples for an earlier-reset window were
+  rejected outright — the live window had 2 samples in 28h, leaving →NN% on
+  cold priors); (2) a flat 20%/h plausibility cap silently rejected genuine
+  heavy parallel-session burn (observed 37%/h on the 5h window), so the
+  "recent rate" never existed exactly when it mattered — caps are per-window
+  now (5h 60%/h, 7d 10%/h) with a ≥300s observation-span floor as the glitch
+  filter; (3) the 7d projection ignored current momentum entirely — the rate
+  measured over the last 3h now carries the next ≤3h (it can only raise the
+  bucket estimate, never lower it).
+
+### Changed
+- **Battery bar fill is now a same-hue gradient.** The left cell anchors the
+  exact severity colour (green/yellow/red semantics unchanged), fading darker
+  toward the progress tip by scaling toward black — hue stays rich, the tip
+  melts softly into the empty section, and a lone filled cell stays pure
+  colour. Bar frame, ⏰, separators and all classic identity elements are
+  untouched.
+
+---
+
+## v3.13.6 — 2026-06-11
+
+### Fixed
+- **Switching Claude accounts no longer keeps showing the previous account's
+  5h/7d usage.** The shared stores (`rate_latest.json`, `rate_projection.json`)
+  were account-global with no account key, so after `/login` to a different
+  account the old account's reading stayed "plausible" for days and its later
+  `resets_at` won every reconcile merge — the bar stayed pinned to the old
+  account's percentages (and its learned `→NN%` projections) until the old
+  window expired. Both stores are now keyed by the logged-in account
+  (`oauthAccount.accountUuid` from `~/.claude.json`, memoized on file
+  mtime/size — renders normally pay only a `stat()`): each account gets its own
+  `rate_latest.<uuid>.json` / `rate_projection.<uuid>.json`, switching back
+  restores that account's own data, and when the account can't be detected
+  (API-key/headless setups) the legacy unsuffixed paths keep working unchanged.
+
+---
+
+## v3.13.5 — 2026-06-10
+
+### Fixed
+- **The `→NN%` projection relearns after an official re-baseline instead of
+  freezing for the rest of the window.** The sample recorder refused any
+  same-window reading at or below the recorded max — meant to filter stale
+  session replays, but those are already gated upstream by the reconcile merge
+  (v3.13.3/v3.13.4). After Anthropic re-baselined the weekly limit (19% → 3%),
+  no new sample could be recorded until usage exceeded the old 19%, so the
+  projection kept showing a pre-rebaseline `→100%` for days. A converged
+  reading below the same-reset max now means the limit changed: all stored
+  samples for that window are in old-denominator units and incomparable, so
+  they're dropped, display smoothing restarts, and the projection relearns
+  from the window's bucket priors onward.
+
+---
+
+## v3.13.4 — 2026-06-10
+
+### Fixed
+- **Idle Claude Code windows can no longer pin the 5h/7d bars to hours-old
+  readings.** An open-but-idle window replays its last `rate_limits` blob on
+  every statusline render. If that blob's `five_hour` `resets_at` is already in
+  the past, the whole blob is hours old (a fresh API response always carries a
+  future 5h reset) — yet its `seven_day` value still looked plausible and kept
+  "re-confirming" the shared store, defeating v3.13.3's 120s re-baseline grace
+  (observed live: frozen sessions replaying 7d=15% blocked the official 3%
+  indefinitely). Blob freshness is now judged as a whole: a blob with any
+  implausible window reset neither overwrites the shared reading nor restarts
+  the grace clock.
+
+---
+
+## v3.13.3 — 2026-06-10
+
+### Fixed
+- **5h/7d bars no longer stick at a stale high % when Anthropic re-baselines
+  usage mid-window.** When account limits change (e.g. the weekly limit is
+  raised), the official `used_percentage` can drop within the same window —
+  observed live: `/usage` said 3% while the bar was pinned at 19% (and would
+  have stayed there until the weekly reset). The cross-session merge assumed
+  "within a window, used% only grows" absolutely; it now tracks when the stored
+  reading was last confirmed by any live session (`observed_at` in
+  `rate_latest.json`) and accepts an official downward revision once the old
+  value has gone unconfirmed for 120s. Stale idle-session replays still can't
+  drag the bar down — any session that still sees the higher value re-confirms
+  it every render and keeps the grace clock ticking. Pre-existing stores
+  without `observed_at` heal on the first render after upgrading.
+
+---
+
+## v3.13.2 — 2026-06-09
+
+### Changed
+- **Effort gradient reworked to match Claude Code's own effort ladder.** A vivid
+  monotonic cool→purple spectrum — low/auto teal · medium azure · high blue ·
+  xhigh indigo · max violet · **ultracode** magenta — with each tier sweeping
+  toward the next hue so it reads as a real gradient (not a flat block) and the
+  level is obvious. (The old rainbow made coral `max` look "hotter" than
+  `ultracode`, inverting the order.)
+- **`ultracode` is shown as `ultracode(+workflows)`** to spell out what it means
+  (Claude Code: `ultracode = xhigh + workflows`).
+
+---
+
+## v3.13.1 — 2026-06-07
+
+### Fixed
+- **The `→NN%` projection no longer vanishes near a reset.** v3.12.1 hid the
+  projection when it rounded to the current usage (to avoid a redundant-looking
+  `→47%` next to `47%`), but that made it disappear entirely on a window that's
+  nearly reset or flat. It's now always shown — `→47%` next to `47%` is honest
+  ("you'll end about here"), not broken.
+
+---
+
+## v3.13.0 — 2026-06-07
+
+### Added
+- **Session-mode line (`show_mode`, default on).** A dedicated `⚙` line shows
+  how the current turn is configured — `⚙ effort:high · think:on · fast:off ·
+  style:default` — read straight from Claude Code's stdin (`effort.level`,
+  `thinking.enabled`, `fast_mode`, `output_style`). Each field is dropped when
+  absent. `cs config set show_mode false` to hide.
+- **Per-effort gradient (`mode_gradient`, default on).** The whole mode line is
+  tinted with a static gradient whose palette depends on the effort tier — a
+  cool→hot ladder so the level is obvious at a glance: low/auto slate, medium
+  blue, high cyan, xhigh amber, max coral, ultracode pink→purple. Static, not
+  animated: an external statusLine is re-invoked at ≤1 Hz, so motion can only
+  flicker — a stable per-tier sweep is the clean result. `cs config set
+  mode_gradient false` falls back to plain per-tier text colours.
+
+### Fixed
+- **Reconcile rejects implausible reset times.** A bogus far-future `resets_at`
+  (e.g. from corrupt/odd input) used to poison the account-global reconcile
+  store permanently — "later reset wins" meant the real, smaller reset could
+  never replace it, showing absurd timers like `⏰2283122h`. Reconcile now
+  ignores resets beyond a window-length-plus-slack and lets a plausible reading
+  replace a poisoned one (self-healing).
+
+---
+
+## v3.12.1 — 2026-06-07
+
+### Fixed
+- **Projection no longer echoes the current usage.** The `→NN%` projection is
+  floored at current usage, so when it predicted no visible growth it would
+  render right next to an identical number (`1% … →1%`) and read as a broken
+  chip. It's now shown only when it forecasts a higher whole percentage;
+  otherwise it's hidden (e.g. near a reset, or while usage is flat).
+- Release guard: `pyproject.toml`, `.claude-plugin/marketplace.json`, and
+  `.claude-plugin/plugin.json` versions are now kept in lock-step (a test fails
+  the build if they drift) — the marketplace had silently lagged at 3.10.0.
+
+---
+
+## v3.12.0 — 2026-06-05
+
+### Added
+- **Version on the bar (`show_version`, default on).** A faint `· vX.Y.Z` at the
+  very end of the identity line — rendered in the darkest grey + a dim attribute
+  so it's there when you look but never competes for attention. (Terminals can't
+  shrink the font, so "faint" is how it stays unobtrusive.) Disable with
+  `cs config set show_version false`.
+- **Update hint.** When a newer version is on PyPI, an amber `↑<newver>` appears
+  right after the version (e.g. `· v3.11.2 ↑3.12.0`). The background update check
+  caches the latest version locally; the render path only reads that cache (no
+  network, no per-second cost) and shows the arrow when newer — and stays silent
+  if the cached check is stale.
+
+---
+
+## v3.11.2 — 2026-06-05
+
+### Changed
+- **`show_lines` is now on by default.** The identity line shows Claude Code's
+  session lines-changed tally (`+182 -47`, +green/−red) out of the box. Disable
+  with `cs config set show_lines false`.
+- **Changelog is easier to find.** The PyPI project page now links the changelog
+  and releases directly (project URLs), so you can see what changed without
+  digging through the repo.
+
+---
+
+## v3.11.1 — 2026-06-04
+
+### Fixed
+- **Projection learning data is now kept clean.** The `→NN%` learner could be
+  polluted by stale/odd samples; hardened so it learns only trustworthy slopes:
+  - projections now reconcile against the account-global latest reading first,
+    so an old Claude window can't write an expired low percentage into history;
+  - within a reset window only increasing usage change-points are kept (no
+    per-render duplicates), and bucket-rate learning ignores duplicate,
+    decreasing, and cross-reset samples — killing the false high slopes that the
+    coarse integer `used_pct` steps used to create;
+  - a window is only recorded as "closed" when its reset time moves *forward*, so
+    an old session bouncing backwards no longer looks like a new window.
+- **The bar itself now reconciles too.** The `5h/7d` percentage and reset timers
+  use the same account-global reconciled reading as the projection/forecast, so
+  all open windows show consistent numbers (previously only the projection did).
+
+### Changed
+- **Per-tick projection cache.** Projection results are memoized for ~1s keyed on
+  the reconciled reading, and history is compressed + bounded on load, so the
+  render path doesn't recompute the learned model every tick.
+
+---
+
+## v3.11.0 — 2026-06-02
+
+### Added
+- **Always-visible rate-limit projections (`show_projection`, default on).**
+  The 5h/7d windows now show `→NN%` estimates for expected end-of-window usage.
+  The model records local samples, learns coarse usage rhythm, smooths by sample
+  time instead of render frequency, and keeps a bounded error log for future
+  tuning. Disable with `cs config set show_projection false`.
+- **Separate imminent ETA warning (`show_forecast`, default on).** `show_forecast`
+  now controls only the `⚠~ETA` chip, which appears after the projection when a
+  window is projected to hit 100% before reset and the cap is imminent.
+
+### Fixed
+- **`context_window.used_percentage = null` handled as unknown.** Claude
+  sometimes sends `null`; rendering now treats it as unknown (context tokens
+  fall back to input+output token totals) instead of dropping into the
+  expensive claude-monitor reset-time fallback path.
+
+### Changed
+- **Daemon renders only active windows.** `_active_sessions()` now uses a 10s
+  freshness window (sorted freshest-first) rather than the 24h GC threshold, so
+  stopped Claude windows keep their dirs for GC but leave the 1Hz work set. The
+  thin client only signals an "outdated daemon" when the daemon genuinely
+  predates the installed package code — not on ordinary age-stale output (which
+  was letting a slow shared daemon get killed by sessions it hadn't reached).
+
+---
+
+## v3.10.0 — 2026-06-02
+
+### Added
+- **Live-activity line (3rd line).** An opt-in third status line surfaces what
+  Claude is doing *right now*, parsed from the transcript via the same bounded
+  reverse-tail read (≤320 KB) the cache countdown already uses:
+  - **Todos** `▸ <in-progress task> (3/7)` — from the newest `TodoWrite` (full
+    list, last-write-wins). On by default (`show_todos`); it's the clearest
+    "is my long turn making progress?" signal.
+  - **Active tool** `◐ Edit auth.py` (newest tool_use with no result yet). MCP
+    names shortened (`mcp__figma__get_screenshot` → `get_screenshot`). Opt-in
+    (`show_tools`). A separate completed-tool rollup `✓ Edit×14 Bash×6` is
+    available via `show_tool_rollup` (a volume tally; default off).
+  The line is style-agnostic (renders the same under classic / capsule /
+  hairline) and is omitted entirely when nothing is active. The curated
+  main line is untouched.
+- **Identity line gains opt-in session context.** Next to `⤷ project ⎇ branch`:
+  - **git ahead/behind** `↑2↓1` (`show_ahead_behind`) — reuses the dirty-state
+    `git status --branch` call, no extra spawn; arrows only for nonzero
+    directions.
+  - **session duration** `⏱ 12m` (`show_duration`) and **lines changed**
+    `+182 -47` (`show_lines`, +green/−red) — straight from stdin. These are
+    Claude Code's own cumulative session tally, not a git diff.
+- **Running subagents** — one **bottom line per agent** `◐ explore[haiku]
+  <task> 2m15s` (`show_agents`, opt-in, **default off**). Background agents are
+  detected as running until their queue-operation task-notification (their
+  immediate launch-ack tool_result does *not* count as completion). Off by
+  default because Claude Code already shows background agents in its own
+  native panel, so enabling this largely duplicates it.
+- **`.claude-plugin/marketplace.json`** — the repo is now a self-hosted plugin
+  marketplace: `/plugin marketplace add leeguooooo/claude-code-usage-bar` then
+  `/plugin install claude-statusbar`. (The render engine is still the `cs` CLI
+  from PyPI.)
+- **`bar_shimmer` (experimental, opt-in, default off, classic only)** — a faint
+  twinkling starfield in the *empty* portion of the 5h/7d battery bars: a static
+  high/mid/low dot field with bright stars (`✦`/`✧`) winking in and out. The
+  fill color is never changed. Capped at the statusLine's ~1Hz refresh, so it's
+  a gentle twinkle, not a smooth animation. `cs config set bar_shimmer true`.
+- **Local worktree detection** — the identity line shows a bare `[worktree]`
+  marker when the checkout is a linked git worktree (detected from `.git`
+  pointing under `worktrees/`), independent of whether Claude Code passes the
+  hint.
+
+### Changed
+- **One transcript scan, not two.** The cache countdown and the activity line
+  now share a single bounded reverse-tail read (`read_activity` also returns
+  `cache_age_seconds`/`cache_ttl`). Also makes the cache countdown
+  **per-session-correct** — it reads the session's own transcript instead of
+  the shared top-level `last_stdin.json` (which is last-writer-wins across
+  windows and could show another session's cache age).
+
+### Fixed
+- **Auto-update now actually runs in daemon mode, without blocking renders.**
+  Previously the once-a-day check only fired on the rare inline-fallback path
+  (the daemon suppresses it and `cs render` just cats a frame), and when it did
+  fire it ran the upgrade *synchronously* (up to ~65s) in the triggering render.
+  Now the check spawns a **detached** background upgrade (never blocks), and the
+  **daemon** triggers it on its own 24h-throttled cadence. After a successful
+  upgrade the package mtime changes and the daemon restarts onto new code via
+  the existing code-drift detection.
+
+### Robustness
+- The activity scan is fully defensive against malformed transcript shapes
+  (non-string `file_path`, non-dict tool `input`, non-string `timestamp`) and
+  is wrapped so any scanner failure degrades to "no activity line" rather than
+  blanking the whole status bar — the scan runs before `main()`'s try/except.
+
+## v3.9.1 — 2026-05-29
+
+### Changed
+- **Cache countdown always shows seconds.** The adaptive granularity that
+  collapsed the 5min–1h band to a bare `Xm` (and the hour band to `Xh`/`XhYm`)
+  is gone. The countdown now always renders the seconds field — `58m23s`,
+  `1h59m03s`, `47s` — so it visibly ticks every render. A static `58m` read
+  as frozen; a ticking `58m23s` makes it obvious the widget is live and the
+  number is real. This pairs with v3.9.0's TTL auto-detect: subscription
+  users now sit in the 5min–1h band most of the time, which previously showed
+  no motion at all. Severity colors are unchanged — anything ≥1min keeps its
+  `m`/`h` glyph → green; sub-minute stays bare seconds → yellow.
+
+## v3.9.0 — 2026-05-29
+
+### Changed
+- **Cache countdown auto-detects the TTL.** The `cache 4m23s` countdown no
+  longer trusts a fixed config value for the prompt-cache TTL. It now reads
+  the ground truth Anthropic reports on every turn —
+  `message.usage.cache_creation` buckets cache-write tokens by TTL, so a
+  nonzero `ephemeral_1h_input_tokens` means a 1-hour `cache_control` ttl and
+  `ephemeral_5m_input_tokens` means 5 minutes. This fixes a systematic
+  ~55-minute early `cache COLD` for **Claude subscription (Pro/Max)** users:
+  on a subscription, Claude Code requests the 1-hour TTL automatically, but
+  the bar was hard-coded to 5 minutes. The detected value already reflects
+  subscription-vs-API-key auth, `ENABLE_PROMPT_CACHING_1H`,
+  `FORCE_PROMPT_CACHING_5M`, and the over-quota → 5m downgrade, so no static
+  config could match it. Detection shares the existing reverse-tail read of
+  the transcript (one pass, still capped at 320 KB), pulling age and TTL
+  together; a final read-only turn (both buckets 0) keeps its age but falls
+  through to the last turn that actually wrote cache. When no write signal
+  exists (caching disabled / ancient transcript) it falls back to a
+  conservative 300 s — early COLD beats claiming a dead cache is warm.
+
+### Deprecated
+- **`cache_ttl_seconds` config.** No longer consulted for rendering (the TTL
+  is auto-detected). The key stays parseable and `cs config set
+  cache_ttl_seconds …` still succeeds so existing configs don't break, but it
+  has no effect.
+
+## v3.8.1 — 2026-05-21
+
+### Fixed
+- **Outdated daemon after PyPI upgrade.** Long-lived daemon kept serving
+  stale renders because its `rendered.meta.json` was fresh by the 5 s
+  age check and lazy-spawn refused to restart over a live pidfile. Now
+  the daemon writes `daemon_started_at` into meta, and the thin client
+  compares it against the installed package's newest `.py` mtime — if
+  disk is newer than the running daemon, the meta is treated as stale,
+  the old daemon gets `SIGTERM`, and `_spawn_daemon_async` brings up a
+  fresh process on the next tick. Pre-3.8.1 daemons (without the new
+  field) keep the old age-only behavior for smooth rollout.
+
+## v3.8.0 — 2026-05-21
+
+### Added
+- **Project + branch identity segment (default on).** Renders a second
+  line `⤷ <project> ⎇ <branch>●` below the existing status bar. Project
+  name is read from Claude Code's `workspace.repo.name` stdin field
+  (falls back to cwd basename); branch comes from `.git/HEAD` directly
+  (no `git` fork on the render hot path); the `●` dirty marker is
+  refreshed in the background by a detached
+  `python -m claude_statusbar._git_refresh` helper and cached for 5 s,
+  so the inline render stays well under its 30 ms budget. Daemon mode
+  exposes the same helper for in-thread cache warming. Outside a git
+  repo the line collapses to `⤷ <project> (no git)`. Disable with
+  `cs config set show_project_branch false`.
+
+---
+
+## v3.7.0 — 2026-05-15
+
+### Added
+- **`cs --setup --project [PATH]`** — write a project-level
+  `.claude/settings.json` (PATH defaults to the current directory) that
+  overrides the global statusLine. Use this when another tool keeps
+  reclaiming the user-level slot — the project file wins for any Claude
+  Code session opened in that directory. Preserves other keys (hooks,
+  permissions, etc.); refuses to trample a non-cs `statusLine` already
+  present. Honors `--inline`.
+- **Displacement warning on the bar.** If `~/.claude/settings.json`
+  `statusLine.command` no longer resolves to one of our binaries (`cs` /
+  `cstatus` / `claude-statusbar`), `cs render` appends a short red
+  `⚠ statusLine 被 <foreign> 占用 · cs --setup` suffix to the bar line.
+  Fires in both the fast (daemon-cat) path and the inline fallback —
+  useful when a project keeps `cs` alive via the new `--project` override
+  but the global file got hijacked. You see it the moment the bar renders.
+
+### Fixed
+- `ensure_project_statusline_configured` refuses to overwrite a
+  `.claude/settings.json` that exists but can't be read (e.g. permission
+  denied). Previously the read error was swallowed and treated as
+  "empty," which would have silently clobbered the file on the next write.
+- Clean error messages when `.claude` exists as a regular file (instead
+  of a directory) or when the project path can't be resolved (symlink
+  loop, unresolvable `~`). No more raw `NotADirectoryError` traceback.
+- `cs --project` without `--setup` is now rejected by argparse; the flag
+  used to be silently swallowed and the bar would render normally.
+
+---
+
+## v3.6.0 — 2026-05-08
+
+### Changed
+- **`cs --setup` defaults to daemon (fast) mode.** Previously you had to remember
+  `--fast` to get the long-lived daemon + `cs render` thin client; the bare
+  `cs --setup` wrote inline mode at refreshInterval=1, which costs ~3% CPU
+  continuously. Daemon mode keeps it under 1% with smoother per-second ticks.
+  Existing users running `cs --setup` after upgrading will be auto-bumped from
+  inline to daemon. To opt out, run `cs --setup --inline`. The legacy `--fast`
+  flag still works (no-op now). Daily auto-repair (background) preserves the
+  user's existing fast/inline choice — it doesn't reach into your settings to
+  change policy on you.
+
+### Fixed
+- **`cs --setup --inline` now actually downgrades.** In 3.5.x, passing `fast=False`
+  to `ensure_statusline_configured` quietly preserved an existing fast-mode
+  config (the OR-with-existing logic was meant for the auto-repair path but
+  blocked explicit user requests). The function is now tri-state:
+  `fast=None` preserves existing (auto-repair); `fast=True/False` is an
+  explicit user request and is respected.
+- **Python 3.9 compatibility.** `updater.py` and `cli.py` used PEP-604 union
+  syntax (`X | None`) at runtime, which 3.9 doesn't support. Added
+  `from __future__ import annotations` so all annotations are lazy strings.
+  CI on 3.9 was failing in 3.5.x — verified now passing on 3.9–3.12.
+
+### Added
+- GitHub Actions CI: pytest matrix on Python 3.9–3.12, ruff lint job,
+  cancel-in-progress concurrency, `contents: read` permissions only.
+- `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1).
+- Animated hero GIF at `docs/images/hero.gif` (driven by `scripts/hero.tape`,
+  rebuilt via `bash scripts/build-hero-gif.sh`).
+- Issue & PR templates under `.github/`.
+
+---
+
+## v3.5.1 — 2026-05-08
+
+### Changed
+- **`show_cache_age` default flipped to `True`** — the cache-expiry countdown
+  is one of the v3.2 highlights and friendlier as opt-out than opt-in. Users
+  who explicitly set `show_cache_age: false` are unaffected; the new default
+  only applies when the field is missing from `~/.claude/claude-statusbar.json`.
+
+### Documentation
+- README documents `npx skills add leeguooooo/claude-code-usage-bar -g -y` as
+  an installable path for users who already have the `cs` binary and want only
+  the conversational skill. The skill repo structure (`skills/<name>/SKILL.md`)
+  is recognized by `npx skills` out of the box.
+
+## v3.5.0 — 2026-05-08
+
+### Added
+- **Consolidated `claude-statusbar` skill.** One Claude Code skill that handles
+  all `cs` operations conversationally. Say "switch theme to nord" /
+  "余量颜色改成 #4ec85b" / "diagnose why my bar isn't showing" and it routes
+  to the right `cs` command. Auto-installed alongside slash commands by
+  `cs --setup`; standalone install via `cs install-skill` or
+  `npx skills add leeguooooo/claude-code-usage-bar`. Old slash commands
+  (`/statusbar`, `/statusbar-theme`, etc.) still work.
+- New `cs install-skill` subcommand for skill-only installs (mirrors the
+  semantics of `cs install-commands`: idempotent, `--force` to overwrite user
+  edits).
+
+### Plumbing
+- `pyproject.toml` package-data now includes `skills/**/*.md`; the skill
+  source ships at `skills/claude-statusbar/SKILL.md` (top-level for
+  visibility) and is mirrored to `src/claude_statusbar/skills/...` for wheel
+  packaging — same pattern as the existing `commands/` directory.
+
+## v3.4.1 — 2026-05-07
+
+### Added
+- **Per-severity color overrides.** `cs config set color_ok "#4ec85b"` (and
+  `color_warn` / `color_hot`) layers your own RGB on top of any theme without
+  touching the theme's other fields. Empty string clears the override; accepts
+  `#rgb`, `#rrggbb`, with or without the leading `#`. Useful when you like a
+  theme's overall feel but want a sharper "calm" green or a softer warning
+  color.
+
+### Fixed (codex post-release review)
+- README themes table now lists all 9 themes (`catppuccin-mocha` and
+  `tokyo-night` were missing from the configuration row).
+- `tests/test_config.py` parametrize covers the two new themes.
+- `.claude-plugin/plugin.json` description bumped from a `v3.2` blurb to one
+  that reflects v3.4 features.
+
+## v3.4.0 — 2026-05-07
+
+### Added
+- **Per-segment color management.** Before, when `7d` hit warning the entire
+  line tinted yellow (5h label, separators, model, all sharing a single
+  `overall_color = max(severity)`). Now each numeric segment colors itself by
+  its own pct: 5h sees only `msgs_pct`, 7d sees only `weekly_pct`, the
+  model+context block sees `ctx_used_pct`, cache keeps its own string-age
+  severity. No color leaks across segments.
+- **Classic style now respects themes.** `progress.py` previously used raw
+  8-color ANSI (`\033[32/33/31m`) regardless of theme. Switching theme had
+  zero effect on classic. Now classic pulls from
+  `theme.s_ok / s_warn / s_hot`, so all 9 themes finally apply to it.
+- **Hierarchy via mute.** `[ ]` brackets, `(used/size)` parens, and the
+  ` | ` separator move to `theme.mute` so the bright severity colors only
+  paint actual data. Numbers and time stay the visual focus.
+- **Two new themes.** `catppuccin-mocha` (community-favorite pastel, easy on
+  long viewing) and `tokyo-night` (deeper neon-blue mood with restrained
+  accents). Both honor the per-segment severity contract.
+- **`theme.pill_cost` field.** Capsule's `$` cost pill stops sharing
+  `pill_lang` with the language pill (a longstanding color collision). New
+  mandatory field on every theme; existing fields unchanged.
+- **`ctx_pct` plumbed through.** `core.py` now computes a nullable
+  `Optional[float]` from `context_window_size > 0` (not falsy
+  `raw_pct == 0`, which would conflate genuine 0% with "no context info").
+  All three styles consume it; capsule gains a model-pill severity dot,
+  hairline colors the model text.
+
+Visual identity unchanged: battery bar with overlaid percentage, `[ ]`
+brackets, `🕐` / `⏰` clock emojis, and ` | ` separators all kept. This is a
+palette + scoping refinement, not a redesign.
+
+## v3.2 (cumulative through v3.3.4)
+
+### Added
+- **Daemon fast-mode.** `cs --setup --fast` swaps the statusLine command to
+  `cs render` backed by a long-lived `cs daemon`. At `refreshInterval: 1` this
+  cuts continuous CPU from ~6% to ~2%, render wall-clock from ~60ms to ~5ms.
+  Crash-safe (auto-falls-back to inline render if the daemon dies;
+  lazy-respawns).
+- **OS-managed daemon.** `cs daemon install` installs a launchd agent (macOS)
+  or systemd user unit (Linux) so the daemon auto-starts on login and is
+  restarted on crash by the OS.
+- **`cache 4m23s` countdown.** Counts down to Anthropic's prompt-cache expiry
+  (default 5min TTL); flips through green → yellow (<1min) → red `cache COLD`.
+  Configurable TTL via `cs config set cache_ttl_seconds 3600` for users on the
+  1-hour extended cache. **For Pro/Max subscribers**, cache hits consume ~10×
+  less of your 5h / 7d rate-limit quota — letting it go COLD costs you ~10×
+  more quota on the next prompt. The widget tells you whether to send now or
+  wrap up first.
+- **`cs doctor` 1Hz hint.** Detects `refreshInterval ≤ 2s` with the inline
+  command and recommends `cs --setup --fast`.
+- **Import-shaving on the inline path.** Even users who don't opt into daemon
+  mode get ~30% faster renders.
+- **Per-session daemon state (v3.3.0).** Each Claude Code `session_id` routes
+  to `~/.cache/claude-statusbar/sessions/<sid>/`, fixing a multi-window race
+  where two sessions could write the same render file.
+- **`cs preview --theme` / `--style` filter (v3.3.2).**
+- **Adaptive cache granularity (v3.3.2).**
+- **Codex review follow-ups (v3.3.3, v3.3.4).**
+
+Daemon mode remains opt-in.

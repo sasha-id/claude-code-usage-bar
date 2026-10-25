@@ -1,492 +1,35 @@
 #!/usr/bin/env python3
 """
-Claude Code Status Bar Monitor.
-
-Context-window and model data arrive via the stdin payload that Claude Code
-sends to custom `statusLine` commands. Default-backend rate limits come from
-that payload too; the Kimi backend reads a small credential-scoped cache and
-refreshes it from Kimi's usage API when needed. This module renders the status
-line without subprocesses.
+Claude Code Status Bar Monitor - Final Fixed Version
+Resolves dependency issues, ensuring operation in any environment
 """
 
-import hashlib
 import json
-import math
-import re
 import sys
-import logging
 import os
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
-from urllib.parse import urlparse
-import urllib.request
+from typing import Any, Dict, Optional, Tuple
 
-from .progress import format_status_line
+# Heavy stdlib imports (logging, subprocess, shutil, re) are deferred to
+# the functions that use them — they collectively cost ~12ms at import time
+# and most are only touched on the slow analysis path (claude-monitor
+# subprocess, error logging) or in occasional model-string cleanup.
 
-# Suppress log output
-logging.basicConfig(level=logging.ERROR)
-
+# Module-local logger handle. We only build it on first use; the import
+# itself was costing ~2ms even though most renders never log anything.
+_logger = None
 CTX_STATE_FILE = Path.home() / ".cache" / "claude-statusbar" / "ctx_state.json"
-CTX_STATE_LEASE_S = 1
-CTX_STATE_MAX_SESSIONS = 32
 
 
-def _claim_file_lease(path: Path, lease_s: float):
-    """Try to hold an advisory lock for the whole critical section.
-
-    ``lease_s`` remains in the private signature for callers that pass the
-    old expiry setting. Advisory locks are released by the OS when a process
-    exits, so a delayed owner cannot be reclaimed while it can still commit a
-    stale state file.
-    """
-    del lease_s
-    lease_path = path.with_name(f"{path.name}.lock")
-    try:
-        lease_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(lease_path.parent, 0o700)
-        except OSError:
-            pass
-    except OSError:
-        return None
-
-    try:
-        fd = os.open(str(lease_path), os.O_RDWR | os.O_CREAT, 0o600)
-        if os.name == "nt":
-            import msvcrt
-
-            if os.fstat(fd).st_size == 0:
-                os.write(fd, b"\0")
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (ImportError, OSError):
-        try:
-            os.close(fd)
-        except (NameError, OSError):
-            pass
-        return None
-    return fd, lease_path
-
-
-def _release_file_lease(lease) -> None:
-    if lease is None:
-        return
-    fd, _ = lease
-    try:
-        if os.name == "nt":
-            import msvcrt
-
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    except (ImportError, OSError):
-        pass
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-
-
-def _smooth_context(session_id, cur_used, cur_size, state_path=None):
-    """Debounce the context-window reading to stop the 0<->N status-bar flicker.
-
-    When Claude Code is routed through a gateway (litellm/OpenRouter) it hands
-    the status line transient context readings on sub-second refreshes: a single
-    refresh may report a much smaller context (a subagent / auxiliary request's
-    usage) or omit it entirely (reads as 0). Direct Anthropic doesn't do this.
-
-    We keep the last *stable* per-session value and:
-      - hold it when a refresh omits context (cur_used <= 0),
-      - hold it through a large single-refresh drop (transient dip),
-      - accept a large drop only once a second refresh confirms it (real
-        /compact), and accept growth / small changes immediately.
-
-    Returns (used_tokens, size) to display.
-    """
-    path = Path(state_path) if state_path else CTX_STATE_FILE
-    session_key = str(session_id or "")
-    if not session_key:
-        return cur_used, cur_size
-
-    def get_sessions(raw):
-        if not isinstance(raw, dict):
-            return {}
-        sessions = raw.get("sessions")
-        if isinstance(sessions, dict):
-            return sessions
-        if "session_id" in raw:
-            return {str(raw.get("session_id") or ""): {
-                "shown_used": raw.get("shown_used", 0) or 0,
-                "shown_size": raw.get("shown_size", 0) or 0,
-                "pend_used": raw.get("pend_used"),
-            }}
-        return {}
-
-    def read_state():
-        try:
-            return get_sessions(json.loads(path.read_text(encoding="utf-8")))
-        except (OSError, json.JSONDecodeError, TypeError):
-            return {}
-
-    lease = _claim_file_lease(path, CTX_STATE_LEASE_S)
-    if lease is None:
-        st = read_state().get(session_key)
-        if not isinstance(st, dict):
-            return cur_used, cur_size
-        return (st.get("shown_used", 0) or 0,
-                st.get("shown_size", 0) or cur_size)
-    try:
-        sessions = read_state()
-        st = sessions.pop(session_key, None)
-        if not isinstance(st, dict):
-            st = {"shown_used": 0, "shown_size": cur_size or 0,
-                  "pend_used": None}
-
-        shown_used = st.get("shown_used", 0) or 0
-        shown_size = st.get("shown_size", 0) or 0
-        hold_previous_size = False
-
-        if not cur_used or cur_used <= 0:
-            # context omitted this refresh -> hold last stable value
-            out_used, out_size = shown_used, (shown_size or cur_size)
-            hold_previous_size = True
-        elif shown_used and cur_used < shown_used * 0.8:
-            # large drop: treat as a transient dip unless a 2nd read confirms it
-            pend = st.get("pend_used")
-            if pend and abs(cur_used - pend) <= max(2000, int(shown_used * 0.05)):
-                st["shown_used"], st["pend_used"] = cur_used, None
-                out_used, out_size = cur_used, (cur_size or shown_size)
-            else:
-                st["pend_used"] = cur_used
-                out_used = shown_used
-                hold_previous_size = True
-                out_size = shown_size or cur_size
-        else:
-            # growth or small change -> accept immediately
-            st["shown_used"], st["pend_used"] = cur_used, None
-            out_used, out_size = cur_used, (cur_size or shown_size)
-
-        if cur_size and not hold_previous_size:
-            st["shown_size"] = cur_size
-        st["updated_at"] = time.time()
-        sessions[session_key] = st
-        while len(sessions) > CTX_STATE_MAX_SESSIONS:
-            sessions.pop(next(iter(sessions)))
-        try:
-            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps({"sessions": sessions}), encoding="utf-8")
-            os.replace(tmp, path)
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-        return out_used, (out_size or cur_size)
-    finally:
-        _release_file_lease(lease)
-
-
-def _is_kimi_url(base_url: str) -> bool:
-    try:
-        parsed = urlparse(base_url)
-    except ValueError:
-        return False
-    host = parsed.hostname or ""
-    return (parsed.scheme == "https"
-            and (host == "kimi.com" or host.endswith(".kimi.com")))
-
-
-def _backend() -> str:
-    """Which credential backend this session runs on, from the env Claude Code
-    passes to the status line. The nyx launcher strips ANTHROPIC_BASE_URL on the
-    default (nyx auth) path, so absence means the Anthropic subscription; an
-    HTTPS *.kimi.com host is the kimi-k3 byo backend; anything else is a byo
-    host we have no usage provider for."""
-    base = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
-    if not base:
-        return "default"
-    if _is_kimi_url(base):
-        return "kimi"
-    return "other"
-
-
-def _valid_kimi_window(window: Any) -> Optional[Dict[str, Any]]:
-    """Return one normalized cached Kimi window, or None when invalid."""
-    if not isinstance(window, dict):
-        return None
-    pct = window.get("pct")
-    resets_at = window.get("resets_at")
-    if (isinstance(pct, bool) or not isinstance(pct, (int, float))
-            or isinstance(resets_at, bool)
-            or not isinstance(resets_at, (int, float))):
-        return None
-    try:
-        pct_value = float(pct)
-        reset_value = float(resets_at)
-    except (OverflowError, ValueError):
-        return None
-    if (not math.isfinite(pct_value) or not math.isfinite(reset_value)
-            or pct_value < 0 or reset_value <= 0
-            or int(resets_at) != resets_at):
-        return None
-    try:
-        reset_epoch = int(resets_at)
-        datetime.fromtimestamp(reset_epoch, tz=timezone.utc)
-    except (OverflowError, OSError, ValueError):
-        return None
-    return {"pct": pct_value, "resets_at": reset_epoch}
-
-
-def _valid_kimi_limits(limits: Any) -> Optional[Dict[str, Dict[str, Any]]]:
-    """Keep valid known Kimi windows and reject an entirely invalid schema."""
-    if not isinstance(limits, dict):
-        return None
-    out = {}
-    invalid_window = False
-    for name in ("five_hour", "seven_day"):
-        if name not in limits:
-            continue
-        window = _valid_kimi_window(limits[name])
-        if window is None:
-            invalid_window = True
-        else:
-            out[name] = window
-    return None if invalid_window and not out else out
-
-
-def _parse_kimi_window(detail: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """One Kimi quota window ({limit, used, resetTime}, all strings) ->
-    a finite non-negative percentage and reset epoch, or None on failure."""
-    try:
-        limit = float(detail.get("limit"))
-        used = float(detail.get("used"))
-        resets_at = int(datetime.fromisoformat(
-            detail["resetTime"].replace("Z", "+00:00")).timestamp())
-    except (TypeError, ValueError, KeyError, AttributeError, OverflowError):
-        return None
-    if not math.isfinite(limit) or not math.isfinite(used) or limit <= 0:
-        return None
-    return _valid_kimi_window({"pct": used / limit * 100.0,
-                               "resets_at": resets_at})
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-def _fetch_kimi_usage(base_url: str, token: str) -> dict:
-    """GET <base_url>/v1/usages and map Kimi's quota onto our two windows:
-    weekly (top-level `usage`) -> seven_day, the 300-minute rolling window in
-    `limits[]` -> five_hour. Windows that don't parse are omitted, not fatal.
-    Raises on an unsafe URL or transport/HTTP/JSON errors — the caller
-    (_kimi_usage) degrades."""
-    if not _is_kimi_url(base_url):
-        raise ValueError("Kimi usage requests require an HTTPS kimi.com URL")
-    req = urllib.request.Request(
-        base_url.rstrip("/") + "/v1/usages",
-        headers={"Authorization": f"Bearer {token}", "User-Agent": "KimiCLI/1.6"})
-    opener = urllib.request.build_opener(_NoRedirectHandler())
-    with opener.open(req, timeout=2.5) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    out: dict = {}
-    if isinstance(payload, dict):
-        weekly = payload.get("usage")
-        if isinstance(weekly, dict):
-            parsed = _parse_kimi_window(weekly)
-            if parsed:
-                out["seven_day"] = parsed
-        for item in payload.get("limits") or []:
-            if not isinstance(item, dict):
-                continue
-            window = item.get("window") or {}
-            if not isinstance(window, dict):
-                continue
-            try:
-                is_5h = (int(window.get("duration") or 0) == 300
-                         and window.get("timeUnit") == "TIME_UNIT_MINUTE")
-            except (TypeError, ValueError):
-                continue
-            if is_5h:
-                parsed = _parse_kimi_window(item.get("detail") or {})
-                if parsed:
-                    out["five_hour"] = parsed
-                break
-    return out
-
-
-KIMI_USAGE_CACHE = Path.home() / ".cache" / "claude-statusbar" / "kimi_usage.json"
-KIMI_USAGE_TTL_S = 60
-KIMI_USAGE_LEASE_S = 10
-KIMI_USAGE_MAX_CACHE_ENTRIES = 16
-
-
-def _kimi_cache_key(base_url: str, token: str) -> str:
-    identity = f"{base_url.rstrip('/')}\0{token}"
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
-
-
-def _read_kimi_cache(path: Path, cache_key: str) -> Optional[Dict[str, Any]]:
-    try:
-        cached = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(cached, dict):
-        return None
-    entries = cached.get("entries")
-    if isinstance(entries, dict):
-        cached = entries.get(cache_key)
-    elif cached.get("cache_key") != cache_key:
-        cached = None
-    if not isinstance(cached, dict):
-        return None
-    limits = _valid_kimi_limits(cached.get("limits"))
-    if limits is None:
-        return None
-    return {"fetched_at": cached.get("fetched_at"), "limits": limits}
-
-
-def _cache_entry_timestamp(entry: Any) -> float:
-    if not isinstance(entry, dict):
-        return 0
-    try:
-        value = float(entry.get("fetched_at"))
-    except (TypeError, ValueError, OverflowError):
-        return 0
-    return value if math.isfinite(value) else 0
-
-
-def _write_kimi_cache(path: Path, cache_key: str, limits: dict) -> None:
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        raw = {}
-    entries = raw.get("entries") if isinstance(raw, dict) else None
-    if not isinstance(entries, dict):
-        entries = {}
-        legacy_key = raw.get("cache_key") if isinstance(raw, dict) else None
-        if isinstance(legacy_key, str) and legacy_key:
-            entries[legacy_key] = {
-                "fetched_at": raw.get("fetched_at"),
-                "limits": raw.get("limits"),
-            }
-    entries[cache_key] = {"fetched_at": time.time(), "limits": limits}
-    for key in sorted(entries, key=lambda item: _cache_entry_timestamp(entries[item])):
-        if len(entries) <= KIMI_USAGE_MAX_CACHE_ENTRIES:
-            break
-        if key != cache_key:
-            entries.pop(key, None)
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(path.parent, 0o700)
-    except OSError:
-        pass
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps({"entries": entries}), encoding="utf-8")
-    os.replace(tmp, path)
-    os.chmod(path, 0o600)
-
-
-def _kimi_cache_is_fresh(cached: Optional[Dict[str, Any]]) -> bool:
-    if cached is None:
-        return False
-    try:
-        fetched_at = float(cached.get("fetched_at"))
-    except (TypeError, ValueError, OverflowError):
-        return False
-    age = time.time() - fetched_at
-    return math.isfinite(fetched_at) and 0 <= age < KIMI_USAGE_TTL_S
-
-
-def _kimi_refresh_marker_path(path: Path, cache_key: str) -> Path:
-    return path.with_name(f"{path.name}.{cache_key}.refresh")
-
-
-def _kimi_refresh_marker_is_fresh(path: Path, cache_key: str) -> bool:
-    marker = _kimi_refresh_marker_path(path, cache_key)
-    try:
-        age = time.time() - marker.stat().st_mtime
-    except OSError:
-        return False
-    return math.isfinite(age) and 0 <= age < KIMI_USAGE_TTL_S
-
-
-def _mark_kimi_refresh(path: Path, cache_key: str) -> None:
-    marker = _kimi_refresh_marker_path(path, cache_key)
-    try:
-        marker.touch(mode=0o600, exist_ok=True)
-        os.utime(marker, None)
-    except OSError:
-        pass
-
-
-def _cleanup_kimi_refresh_markers(path: Path) -> None:
-    try:
-        markers = path.parent.glob(f"{path.name}.*.refresh")
-    except OSError:
-        return
-    now = time.time()
-    for marker in markers:
-        try:
-            age = now - marker.stat().st_mtime
-            if not math.isfinite(age) or age < 0 or age >= KIMI_USAGE_TTL_S:
-                marker.unlink()
-        except OSError:
-            pass
-
-
-def _kimi_usage(base_url: str, token: str, *, cache_path=None, fetcher=None) -> dict:
-    """Kimi quota with a TTL file cache and an exclusive refresh lease.
-    Fresh cache wins; concurrent stale renders serve the cache while its owner
-    fetches. On any fetch failure the stale cache is served regardless of age;
-    no cache + failure -> {} (limit cells omitted). A missing token never
-    fetches. The token is used only in the request header — never cached or
-    logged."""
-    base_url = base_url.strip()
-    path = Path(cache_path) if cache_path else KIMI_USAGE_CACHE
-    cache_key = _kimi_cache_key(base_url, token)
-    fetch = fetcher or _fetch_kimi_usage
-    cached = _read_kimi_cache(path, cache_key)
-    if _kimi_cache_is_fresh(cached):
-        return cached.get("limits") or {}
-    if not token:
-        return {}
-    if _kimi_refresh_marker_is_fresh(path, cache_key):
-        return (cached or {}).get("limits") or {}
-
-    lease = _claim_file_lease(path, KIMI_USAGE_LEASE_S)
-    if lease is None:
-        refreshed = _read_kimi_cache(path, cache_key)
-        return (refreshed or cached or {}).get("limits") or {}
-    try:
-        cached = _read_kimi_cache(path, cache_key)
-        if _kimi_cache_is_fresh(cached):
-            return cached.get("limits") or {}
-        _cleanup_kimi_refresh_markers(path)
-        _mark_kimi_refresh(path, cache_key)
-        try:
-            limits = _valid_kimi_limits(fetch(base_url, token))
-        except Exception:
-            return (cached or {}).get("limits") or {}
-        if limits is None:
-            return (cached or {}).get("limits") or {}
-        try:
-            _write_kimi_cache(path, cache_key, limits)
-            _kimi_refresh_marker_path(path, cache_key).unlink()
-        except OSError:
-            pass
-        return limits
-    finally:
-        _release_file_lease(lease)
+def _get_logger():
+    global _logger
+    if _logger is None:
+        import logging
+        _logger = logging.getLogger(__name__)
+        _logger.setLevel(logging.ERROR)
+        _logger.addHandler(logging.NullHandler())
+    return _logger
 
 
 def parse_stdin_data() -> Dict[str, Any]:
@@ -504,24 +47,43 @@ def parse_stdin_data() -> Dict[str, Any]:
         if not raw:
             return result
 
-        debug_file = Path.home() / ".cache" / "claude-statusbar" / "last_stdin.json"
         data = json.loads(raw)
+        # Mark stdin as valid the moment we parse it. If any per-field
+        # extraction below raises (e.g. Anthropic ships an unexpected shape),
+        # main() must still take the "have stdin" branch and render with the
+        # partial data we managed to extract — not silently fall back to the
+        # "no stdin" path.
+        result['_has_stdin'] = True
 
-        backend = _backend()
+        # Per-session env stamped by render_thin (`_cs_env`): the shared daemon's
+        # os.environ is frozen at its own start and is NOT this session's, so
+        # no-quota detection must read this instead of os.environ when present.
+        session_env = data.get('_cs_env')
+        if isinstance(session_env, dict):
+            result['_session_env'] = {str(k): str(v)
+                                      for k, v in session_env.items()}
+            _env = result['_session_env']
+        else:
+            _env = os.environ
 
-        # Only default-backend rate limits can seed the Anthropic fallback.
-        if backend == "default" and data.get('rate_limits', {}).get('five_hour'):
-            try:
-                debug_file.parent.mkdir(parents=True, exist_ok=True)
-                debug_file.write_text(raw, encoding="utf-8")
-            except OSError:
-                pass
+        from .kimi_cache import is_kimi_url
+        kimi_quota = is_kimi_url(_env.get('ANTHROPIC_BASE_URL', ''))
+        if kimi_quota:
+            result['_kimi_quota'] = True
+
+        # Keep quota-only snapshots scoped to the current account/session.
+        # The global stdin file is diagnostic input, never a quota authority.
+        # Kimi has an independent quota API and must not seed Anthropic state.
+        if not is_no_quota_mode(_env) and not kimi_quota:
+            from .quota_cache import remember
+            remember(data)
 
         # Session ID
         result['session_id'] = data.get('session_id', '')
 
-        # Working directory (used by git_info for branch/worktree detection)
-        result['cwd'] = data.get('cwd', '')
+        # Transcript path — used by the prompt-cache countdown and the
+        # optional live-activity line (todos / active tool / agents).
+        result['transcript_path'] = data.get('transcript_path', '')
 
         # Model
         model_obj = data.get('model', {})
@@ -529,50 +91,118 @@ def parse_stdin_data() -> Dict[str, Any]:
             result['model_id'] = model_obj.get('id', '')
             result['display_name'] = model_obj.get('display_name', '')
 
-        # Rate limits. Which provider's numbers to show depends on the session
-        # backend: default (nyx auth) -> Anthropic subscription, from the stdin
-        # payload (cached-stdin fallback when a payload omits them); kimi ->
-        # Kimi's coding-plan quota from its usages API. The Anthropic fallback
-        # must NOT run on the Kimi backend — it would show a subscription the
-        # session isn't consuming (the stale-numbers-on-kimi bug).
-        if backend == "kimi":
-            usage = _kimi_usage(os.environ.get("ANTHROPIC_BASE_URL", ""),
-                                os.environ.get("ANTHROPIC_AUTH_TOKEN", ""))
-            five = _valid_kimi_window(usage.get("five_hour"))
-            if five:
-                result['rate_limit_pct'] = five['pct']
-                result['rate_limit_resets_at'] = five['resets_at']
-            seven = _valid_kimi_window(usage.get("seven_day"))
-            if seven:
-                result['rate_limit_7d_pct'] = seven['pct']
-                result['rate_limit_7d_resets_at'] = seven['resets_at']
-        else:
-            # Anthropic subscription limits (Claude.ai Pro/Max only)
-            rl = data.get('rate_limits', {})
-            fh = rl.get('five_hour', {})
-            if fh:
-                result['rate_limit_pct'] = fh.get('used_percentage', 0)
-                result['rate_limit_resets_at'] = fh.get('resets_at')
-            sd = rl.get('seven_day', {})
-            if sd:
-                result['rate_limit_7d_pct'] = sd.get('used_percentage', 0)
-                result['rate_limit_7d_resets_at'] = sd.get('resets_at')
+        # Session-mode readout (the ⚙ line): effort level, thinking on/off,
+        # fast mode, output style — all from Claude Code's stdin. Each guarded so
+        # an older Claude Code that omits a field just drops that segment.
+        effort_obj = data.get('effort', {})
+        if isinstance(effort_obj, dict):
+            result['effort_level'] = str(effort_obj.get('level', '') or '')
+        thinking_obj = data.get('thinking', {})
+        if isinstance(thinking_obj, dict) and 'enabled' in thinking_obj:
+            result['thinking_enabled'] = bool(thinking_obj.get('enabled'))
+        if 'fast_mode' in data:
+            result['fast_mode'] = bool(data.get('fast_mode'))
+        style_obj = data.get('output_style', {})
+        if isinstance(style_obj, dict):
+            result['output_style'] = str(style_obj.get('name', '') or '')
 
-            # Fallback: load rate_limits from previous session's cached stdin
-            if not fh and not sd:
-                try:
-                    cached = json.loads(debug_file.read_text(encoding="utf-8"))
-                    cached_rl = cached.get('rate_limits', {})
-                    cached_fh = cached_rl.get('five_hour', {})
-                    cached_sd = cached_rl.get('seven_day', {})
-                    if cached_fh:
-                        result['rate_limit_pct'] = cached_fh.get('used_percentage', 0)
-                        result['rate_limit_resets_at'] = cached_fh.get('resets_at')
-                    if cached_sd:
-                        result['rate_limit_7d_pct'] = cached_sd.get('used_percentage', 0)
-                        result['rate_limit_7d_resets_at'] = cached_sd.get('resets_at')
-                except (OSError, json.JSONDecodeError, TypeError):
-                    pass
+        # Rate limits (Claude.ai Pro/Max only)
+        # Coerce percentages to int and clamp to [0, ∞):
+        # - Anthropic occasionally returns floats like 56.00000000000001
+        # - Reject NaN/inf so they never reach the renderer
+        # - Clamp negatives to 0 (defensive — should never happen in practice)
+        # - Don't cap at 100; values >100% are valid for over-quota indicators
+        import math
+        import time as _time
+        # No real quota percentage reaches this; an implausibly large value is
+        # the known upstream leak where used_percentage carries the reset epoch
+        # (~1.78e9). Reject it rather than render a spurious MAX bar.
+        PCT_LEAK_CEILING = 100000
+        def _pct(v):
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return 0
+            if math.isnan(f) or math.isinf(f):
+                return 0
+            if f >= PCT_LEAK_CEILING:
+                return 0
+            return max(0, int(round(f)))
+
+        # Time-based window rollover (cached-fallback only).
+        # Anthropic only pushes fresh rate_limits when the user actually
+        # makes a request. Fresh stdin we trust verbatim — comparing its
+        # resets_at against local clock can spuriously zero out a still-
+        # valid window on a 1-second boundary, which makes the statusbar
+        # flip between the real pct and 0% across renders.
+        #
+        # For the cached fallback path, if resets_at is in the past the
+        # old window has rolled over and the cached pct is meaningless;
+        # signal "unknown" (None) so the renderer shows "--", not a
+        # bogus authoritative 0%.
+        FIVE_HOUR_S  = 5 * 3600
+        SEVEN_DAY_S  = 7 * 86400
+        # quota_cache rejects snapshots older than ten minutes.
+
+        def _rollover_cached(pct, resets_at, window_s):
+            try:
+                resets_at_f = float(resets_at) if resets_at is not None else None
+            except (TypeError, ValueError):
+                return pct, resets_at
+            if resets_at_f is None:
+                return pct, resets_at
+            if resets_at_f > _time.time():
+                return pct, resets_at  # current window still active
+            # Window expired — pct is unknown until fresh data arrives.
+            elapsed = _time.time() - resets_at_f
+            windows_passed = int(elapsed // window_s) + 1
+            return None, int(resets_at_f + windows_passed * window_s)
+        rl = data.get('rate_limits', {})
+        fh = rl.get('five_hour', {})
+        if fh:
+            # Trust Anthropic's fresh values verbatim.
+            result['rate_limit_pct'] = _pct(fh.get('used_percentage', 0))
+            result['rate_limit_resets_at'] = fh.get('resets_at')
+        sd = rl.get('seven_day', {})
+        if sd:
+            result['rate_limit_7d_pct'] = _pct(sd.get('used_percentage', 0))
+            result['rate_limit_7d_resets_at'] = sd.get('resets_at')
+
+        # Fallback only to quota with a matching account/session owner.
+        if not fh and not sd and not kimi_quota:
+            try:
+                from .quota_cache import read
+                cached_rl = read(data)
+                cached_fh = cached_rl.get('five_hour', {})
+                cached_sd = cached_rl.get('seven_day', {})
+                if cached_fh:
+                    p, ra = _rollover_cached(_pct(cached_fh.get('used_percentage', 0)),
+                                       cached_fh.get('resets_at'), FIVE_HOUR_S)
+                    result['rate_limit_pct'] = p
+                    result['rate_limit_resets_at'] = ra
+                if cached_sd:
+                    p, ra = _rollover_cached(_pct(cached_sd.get('used_percentage', 0)),
+                                       cached_sd.get('resets_at'), SEVEN_DAY_S)
+                    result['rate_limit_7d_pct'] = p
+                    result['rate_limit_7d_resets_at'] = ra
+            except (OSError, json.JSONDecodeError, TypeError):
+                pass
+
+        if kimi_quota:
+            # Never render Anthropic payload/cache values for a Kimi account.
+            for key in ('rate_limit_pct', 'rate_limit_resets_at',
+                        'rate_limit_7d_pct', 'rate_limit_7d_resets_at'):
+                result.pop(key, None)
+            from .kimi_cache import cached_limits
+            limits = cached_limits(_env) or {}
+            five_hour = limits.get('five_hour')
+            seven_day = limits.get('seven_day')
+            if five_hour:
+                result['rate_limit_pct'] = five_hour['pct']
+                result['rate_limit_resets_at'] = five_hour['resets_at']
+            if seven_day:
+                result['rate_limit_7d_pct'] = seven_day['pct']
+                result['rate_limit_7d_resets_at'] = seven_day['resets_at']
 
         # Context window
         cw = data.get('context_window', {})
@@ -580,22 +210,29 @@ def parse_stdin_data() -> Dict[str, Any]:
             result['context_used_pct'] = cw.get('used_percentage', 0)
             result['context_remaining_pct'] = cw.get('remaining_percentage', 100)
             result['context_window_size'] = cw.get('context_window_size', 0)
-            result['total_input_tokens'] = cw.get('total_input_tokens', 0)
-            result['total_output_tokens'] = cw.get('total_output_tokens', 0)
+            if 'total_input_tokens' in cw:
+                result['total_input_tokens'] = cw.get('total_input_tokens')
+            if 'total_output_tokens' in cw:
+                result['total_output_tokens'] = cw.get('total_output_tokens')
+            # Preserve absent vs explicit null: current_usage is authoritative
+            # when present, while null is a lifecycle sentinel after /compact.
+            if 'current_usage' in cw:
+                result['context_current_usage'] = cw.get('current_usage')
 
-        # Debounce context to stop gateway-induced 0<->N flicker (litellm/OpenRouter).
-        # No-op for direct Anthropic, whose readings grow monotonically.
-        size = result.get('context_window_size', 0)
-        pct = result.get('context_used_pct', 0)
-        if pct and size:
-            cur_used = int(size * pct / 100)
-        else:
-            cur_used = result.get('total_input_tokens', 0) or 0
-        sm_used, sm_size = _smooth_context(result.get('session_id', ''), cur_used, size)
-        if sm_size:
-            result['context_window_size'] = sm_size
-            result['context_used_pct'] = round(100.0 * sm_used / sm_size)
-        result['total_input_tokens'] = sm_used
+        # Prompt-cache expiry as Claude Code tracks it. Unlike the transcript's
+        # last assistant turn, it also counts requests that never reach the
+        # transcript (e.g. a plugin forking the conversation to keep the cache
+        # warm), so the countdown prefers it when present.
+        prompt_cache = data.get('prompt_cache', {})
+        if isinstance(prompt_cache, dict):
+            expires_at = prompt_cache.get('expires_at')
+            if (isinstance(expires_at, (int, float))
+                    and not isinstance(expires_at, bool)):
+                try:
+                    if math.isfinite(expires_at):
+                        result['prompt_cache_expires_at'] = float(expires_at)
+                except OverflowError:
+                    pass  # an int too large for a float: keep the transcript countdown
 
         # Session cost
         cost = data.get('cost', {})
@@ -608,23 +245,307 @@ def parse_stdin_data() -> Dict[str, Any]:
         # Version
         result['claude_version'] = data.get('version', '')
 
-        # Reasoning effort / thinking / fast-mode (Claude Code >= v2.1.119).
-        # These are the LIVE session values — effort.level updates on mid-session
-        # /effort changes. `effort` is absent for models without effort support.
-        effort = data.get('effort', {})
-        if isinstance(effort, dict) and effort.get('level'):
-            result['effort_level'] = effort.get('level')
-        thinking = data.get('thinking', {})
-        if isinstance(thinking, dict):
-            result['thinking_enabled'] = bool(thinking.get('enabled'))
-        result['fast_mode'] = bool(data.get('fast_mode'))
+        # Workspace identity (used by the optional project/branch segment).
+        ws = data.get('workspace') or {}
+        if isinstance(ws, dict):
+            result['workspace_current_dir'] = ws.get('current_dir') or data.get('cwd')
+            result['workspace_project_dir'] = ws.get('project_dir')
+            result['workspace_git_worktree'] = ws.get('git_worktree')
+            repo_obj = ws.get('repo') or {}
+            if isinstance(repo_obj, dict):
+                result['workspace_repo_name'] = repo_obj.get('name')
 
-        # Mark that we have valid stdin data
-        result['_has_stdin'] = True
-
-    except (json.JSONDecodeError, TypeError, AttributeError):
+    except json.JSONDecodeError:
+        # Bad JSON from stdin — treat as if there was no stdin at all.
+        result.pop('_has_stdin', None)
+    except (TypeError, AttributeError):
+        # Unexpected shape on a sub-field; preserve _has_stdin so main()
+        # still renders with whatever we managed to extract.
         pass
     return result
+
+
+_OFFICIAL_API_HOST = "api.anthropic.com"
+# Claude Code began emitting official rate_limits around this version. Below it,
+# an official subscription session legitimately has no rate_limits — so the
+# no-quota heuristic must NOT fire there (it would misread an old-client official
+# user as a relay). See _claude_emits_rate_limits / _no_quota_heuristic.
+_RATE_LIMITS_MIN_VERSION = (2, 1, 80)
+
+
+def _env_truthy(value) -> bool:
+    """True for the usual truthy env spellings (handles '1\\n', 'true', ' ON ')."""
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "y", "t"}
+
+
+def _leading_int(token: str) -> int:
+    digits = ""
+    for ch in str(token):
+        if ch.isdigit():
+            digits += ch
+        else:
+            break
+    return int(digits) if digits else 0
+
+
+def _claude_version_at_least(version, minimum) -> bool:
+    """Compare Claude Code versions while tolerating suffixes and junk."""
+    if not version:
+        return False
+    parts = tuple(_leading_int(p) for p in str(version).split(".")[:3])
+    parts = parts + (0,) * (3 - len(parts))
+    return parts >= minimum
+
+
+def _claude_emits_rate_limits(version) -> bool:
+    """True when Claude Code is new enough to emit official rate_limits."""
+    return _claude_version_at_least(version, _RATE_LIMITS_MIN_VERSION)
+
+
+def is_no_quota_mode(env: Dict[str, str], *, override: str = "auto") -> bool:
+    """Return True when official 5h/7d rate-limit quota is structurally absent.
+
+    Triggered by third-party relays (``ANTHROPIC_BASE_URL`` pointing off
+    ``api.anthropic.com``) and cloud backends (Bedrock / Vertex), mirroring
+    claude-hud's ``shouldHideUsage``. In that case the bar drops the quota
+    battery bars and promotes the context window instead.
+
+    Pure function of the process environment plus an explicit override
+    (``auto`` / ``on`` / ``off``) so it stays trivially testable. The env
+    signal is stable from session start, so it never false-positives the
+    "session just started, quota not pushed yet" case the way a bare
+    "no rate_limits" check would.
+    """
+    if override == "on":
+        return True
+    if override == "off":
+        return False
+
+    base = (env.get("ANTHROPIC_BASE_URL") or "").strip()
+    if base:
+        from .kimi_cache import is_kimi_url
+        if is_kimi_url(base):
+            return False
+        from urllib.parse import urlparse
+        # Add a "//" authority prefix when there's no scheme, so urlparse pulls
+        # the host out instead of treating the whole value as a path. Then compare
+        # the parsed host EXACTLY (case-insensitive, trailing dot stripped) — a
+        # raw substring check misreads "API.ANTHROPIC.COM" and lets look-alikes
+        # like "notapi.anthropic.com.evil" pass as official.
+        parsed = urlparse(base if "//" in base else "//" + base)
+        host = (parsed.hostname or "").strip().rstrip(".").lower()
+        if host != _OFFICIAL_API_HOST:
+            return True
+
+    if _env_truthy(env.get("CLAUDE_CODE_USE_BEDROCK")):
+        return True
+    if _env_truthy(env.get("CLAUDE_CODE_USE_VERTEX")):
+        return True
+
+    return False
+
+
+def _no_quota_heuristic(stdin_data: Dict[str, Any], *,
+                        transcript_has_assistant: bool,
+                        claude_version_ok: bool = True) -> bool:
+    """Fallback no-quota detection for when the env signal is absent.
+
+    Insurance for the case where ``ANTHROPIC_BASE_URL`` is set but not inherited
+    by the statusLine subprocess. An official session gets ``rate_limits`` in
+    stdin the moment it has made an API call, and cs caches it — so once an
+    assistant response exists in the transcript, an official session would have
+    quota (live or cached). If a response exists yet quota is still entirely
+    absent, the headers are being stripped by a relay → no-quota mode.
+
+    ``claude_version_ok`` gates this on a Claude Code version that actually emits
+    rate_limits: on an OLD client an official subscription legitimately has no
+    rate_limits, and must NOT be misread as a relay — it keeps the existing
+    waiting/old-client layout instead. Only fires when there's also already an
+    assistant turn, so a brand-new session is never misclassified. Callers gate
+    on api_mode != 'off' and a prior env-detection miss.
+    """
+    if not claude_version_ok:
+        return False
+    if not stdin_data.get('_has_stdin'):
+        return False
+    if stdin_data.get('rate_limit_pct') is not None:
+        return False
+    if stdin_data.get('rate_limit_7d_pct') is not None:
+        return False
+    return transcript_has_assistant
+
+
+def _transcript_has_assistant(transcript_path: str) -> bool:
+    """True when the transcript carries at least one assistant response.
+
+    Reuses ``_last_assistant_info`` (a bounded tail scan, already used for the
+    prompt-cache countdown), which returns None when no assistant entry exists.
+    """
+    if not transcript_path:
+        return False
+    try:
+        return _last_assistant_info(transcript_path) is not None
+    except Exception:
+        return False
+
+
+def _format_balance(entry: dict) -> str:
+    """Render a fresh, supported balance cache entry as ``bal $809.97``.
+
+    Two decimals always — at relay scale the cents are small but a bare
+    ``$810`` would hide that you've already burned into it. Returns "" for a
+    malformed entry so the caller can simply drop the segment.
+    """
+    bal = entry.get("balance")
+    if not isinstance(bal, (int, float)):
+        return ""
+    suffix = ' ⟳' if entry.get('refresh_failed') else ''
+    return f"bal ${bal:,.2f}{suffix}"
+
+
+def _balance_remaining_pct(entry: dict):
+    """Remaining-balance percent (0–100) for the fuel-gauge battery, or None.
+
+    Returns None when ``total`` (the relay's hard_limit) is absent or non-positive
+    — some relays report a sentinel/zero limit, and a gauge off a meaningless
+    total would mislead, so the caller falls back to the plain ``bal $X`` text.
+    """
+    total = entry.get("total")
+    bal = entry.get("balance")
+    if not isinstance(total, (int, float)) or total <= 0:
+        return None
+    if not isinstance(bal, (int, float)):
+        return None
+    return max(0.0, min(100.0, bal / total * 100.0))
+
+
+def kimi_limits(env: Dict[str, str], *, spawn: bool = True):
+    """Return cached Kimi limits immediately; refresh only in the background.
+
+    The live client owns the token. Daemon input carries only ``CS_KIMI_FP``,
+    so it can render the same account's cache but cannot initiate a request.
+    """
+    base = (env.get("ANTHROPIC_BASE_URL") or "").strip()
+    from . import kimi_cache
+    if not kimi_cache.is_kimi_url(base):
+        return None
+    token = ((env.get("ANTHROPIC_API_KEY") or "").strip()
+             or (env.get("ANTHROPIC_AUTH_TOKEN") or "").strip())
+    fp = env.get("CS_KIMI_FP", "")
+    if token:
+        fp = kimi_cache.fingerprint(base, token)
+    elif not (isinstance(fp, str) and len(fp) == 40
+              and all(c in "0123456789abcdef" for c in fp)):
+        return None
+
+    entry = kimi_cache.read_cache(fp)
+    limits = (entry.get("limits") or None) if entry else None
+    if kimi_cache.is_fresh(entry) or not token or not spawn:
+        return limits
+
+    from . import identity as _identity
+    if _identity._BACKGROUND_COLLECTORS:
+        from .refresh_pool import submit
+        from ._kimi_refresh import refresh
+        submit(("kimi", fp), refresh, base, token, fp)
+        return limits
+
+    if not kimi_cache.is_inflight(fp):
+        try:
+            kimi_cache.mark_inflight(fp)
+            import subprocess
+            child_env = dict(os.environ)
+            child_env["CS_KIMI_TOKEN"] = token
+            child_env["CS_KIMI_FP"] = fp
+            subprocess.Popen(
+                [sys.executable, "-m", "claude_statusbar._kimi_refresh", base],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+                env=child_env,
+            )
+        except (OSError, ValueError):
+            kimi_cache.clear_inflight(fp)
+    return limits
+
+
+def relay_balance(env: Dict[str, str], *, spawn: bool = True):
+    """Best-effort relay account balance entry (dict) for the no-quota segment.
+
+    Reads ``ANTHROPIC_BASE_URL`` + the bearer key from ``env``, returns the cached
+    balance entry (``{balance, total, used, ...}``) when fresh & supported, and
+    otherwise kicks off a detached ``_balance_refresh`` probe (when ``spawn`` and
+    not already inflight). Returns None whenever there's nothing to show yet, the
+    relay doesn't expose the OpenAI-compatible billing endpoints (cached
+    ``supported=False``), or no base_url/key is configured — so the segment
+    self-hides, matching the "show it if supported, hide if not" contract.
+
+    Never blocks on the network: the probe always runs in a separate process,
+    exactly like the git dirty-state refresh.
+    """
+    base = (env.get("ANTHROPIC_BASE_URL") or "").strip()
+    key = (env.get("ANTHROPIC_API_KEY") or "").strip()
+    auth = (env.get("ANTHROPIC_AUTH_TOKEN") or "").strip()
+    fp = env.get('CS_BALANCE_FP', '')
+    if not base:
+        return None
+
+    from . import balance_cache
+    if key or auth:
+        fp = balance_cache.fingerprint(base, key or auth)
+    elif not (isinstance(fp, str) and len(fp) == 40
+              and all(c in '0123456789abcdef' for c in fp)):
+        return None
+    entry = balance_cache.read_cache(fp)
+    if balance_cache.is_fresh(entry):
+        return entry if entry.get("supported") else None
+
+    if not (key or auth):
+        return entry if entry and entry.get('supported') else None
+
+    from . import identity as _identity
+    if spawn and _identity._BACKGROUND_COLLECTORS:
+        from .refresh_pool import submit
+        from ._balance_refresh import refresh
+        submit(('balance', fp), refresh, base, key, auth, fp)
+        return entry if entry and entry.get('supported') else None
+
+    if spawn and not balance_cache.is_inflight(fp):
+        balance_cache.mark_inflight(fp)
+        try:
+            import subprocess  # lazy — keep the fresh-cache hot path import-light
+            import sys
+            child_env = dict(os.environ)
+            child_env["CS_BALANCE_FP"] = fp
+            if key:
+                child_env["CS_BALANCE_KEY"] = key
+            if auth:
+                child_env["CS_BALANCE_AUTH"] = auth
+            subprocess.Popen(
+                [sys.executable, "-m", "claude_statusbar._balance_refresh", base],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+                env=child_env,
+            )
+        except (OSError, ValueError):
+            balance_cache.clear_inflight(fp)
+
+    # Stale-but-supported: keep showing the last known balance while the
+    # refresh runs, so the segment doesn't flicker off every TTL boundary.
+    if entry and entry.get("supported"):
+        return entry
+    return None
+
+
+def relay_balance_text(env: Dict[str, str], *, spawn: bool = True) -> str:
+    """Thin string wrapper over ``relay_balance`` — ``bal $…`` or "" (back-compat)."""
+    entry = relay_balance(env, spawn=spawn)
+    return _format_balance(entry) if entry else ""
 
 
 def is_bypass_permissions_active() -> bool:
@@ -634,6 +555,7 @@ def is_bypass_permissions_active() -> bool:
     use a best-effort multi-source approach:
       1. CLAUDE_SKIP_PERMISSIONS env var (set by some wrappers)
       2. settings.json defaultMode == 'bypassPermissions'
+      3. skipDangerousModePermissionPrompt is True AND any bypass hint found
     """
     # 1. Explicit env var
     env_val = os.environ.get('CLAUDE_SKIP_PERMISSIONS', '').lower()
@@ -663,14 +585,9 @@ def get_current_model(stdin_data: Optional[Dict[str, Any]] = None) -> tuple[str,
         display_name = model if model != 'unknown' else 'Unknown'
     return model, display_name
 
-
 def calculate_reset_time(reset_hour: Optional[int] = None) -> str:
-    """Estimate time until the 5-hour window resets.
-
-    Only used in the error-path fallback; the happy path derives reset times
-    directly from the official `resets_at` timestamps in the stdin payload.
-    """
-    # If the user pins a reset hour, honor it.
+    """Calculate time until session reset (5-hour rolling window or custom hour)"""
+    # If user pins a reset hour, honor it before any external calls
     if reset_hour is not None and 0 <= reset_hour <= 23:
         now = datetime.now()
         target = now.replace(hour=reset_hour, minute=0, second=0, microsecond=0)
@@ -682,67 +599,387 @@ def calculate_reset_time(reset_hour: Optional[int] = None) -> str:
         mins = total_minutes % 60
         return f"{hours}h {mins:02d}m"
 
-    # Fallback: assume a fixed 2 PM reset (matches the original project default).
-    now = datetime.now()
-    today_2pm = now.replace(hour=14, minute=0, second=0, microsecond=0)
-    tomorrow_2pm = today_2pm + timedelta(days=1)
-    next_reset = tomorrow_2pm if now >= today_2pm else today_2pm
-    diff = next_reset - now
+    try:
+        import shutil
+        import subprocess
+        # Ask an installed claude-monitor for the session reset time.
+        claude_monitor_cmd = shutil.which('claude-monitor')
+        if claude_monitor_cmd:
+            # Find Python interpreter
+            possible_paths = [
+                Path.home() / ".local/share/uv/tools/claude-monitor/bin/python",
+                Path.home() / ".uv/tools/claude-monitor/bin/python",
+                Path.home() / ".local/pipx/venvs/claude-monitor/bin/python",  # pipx installation
+            ]
+            
+            claude_python = None
+            for path in possible_paths:
+                if path.exists():
+                    claude_python = str(path)
+                    break
+            
+            if not claude_python:
+                try:
+                    with open(claude_monitor_cmd, 'r') as f:
+                        first_line = f.readline()
+                        if first_line.startswith('#!'):
+                            claude_python = first_line[2:].strip()
+                except:
+                    pass
+            
+            if claude_python:
+                code = """
+import json
+from datetime import datetime, timedelta, timezone
+try:
+    from claude_monitor.data.analysis import analyze_usage
+    
+    result = analyze_usage(hours_back=192, quick_start=False)
+    blocks = result.get('blocks', [])
+    
+    if blocks:
+        active_blocks = [b for b in blocks if b.get('isActive', False)]
+        if active_blocks:
+            current_block = active_blocks[0]
+            start_time = current_block.get('startTime')
+            
+            if start_time:
+                # Parse start time
+                if isinstance(start_time, str):
+                    if start_time.endswith('Z'):
+                        start_time = start_time[:-1] + '+00:00'
+                    session_start = datetime.fromisoformat(start_time)
+                else:
+                    session_start = start_time
+                
+                # Session lasts 5 hours
+                session_end = session_start + timedelta(hours=5)
+                now = datetime.now(timezone.utc)
+                
+                if session_end > now:
+                    diff = session_end - now
+                    total_minutes = int(diff.total_seconds() / 60)
+                    
+                    if total_minutes > 60:
+                        hours = total_minutes // 60
+                        mins = total_minutes % 60
+                        print(f"{hours}h {mins:02d}m")
+                    else:
+                        print(f"{total_minutes}m")
+                    import sys
+                    sys.exit(0)
+except:
+    pass
+print("")
+"""
+                # 3s cap — this is invoked from the synchronous render path
+                # in the exception fallback, so a slow claude-monitor must
+                # not stall the status line. On timeout we fall through to
+                # the next-2pm estimate below rather than returning empty.
+                try:
+                    result = subprocess.run(
+                        [claude_python, '-c', code],
+                        capture_output=True,
+                        text=True, encoding="utf-8", errors="replace",
+                        timeout=3
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        return result.stdout.strip()
+                except subprocess.TimeoutExpired:
+                    pass
+    except Exception:
+        pass
+    
+    # No signal: the rolling 5h window is anchored to session start, never to a
+    # 14:00 wall-clock — fabricating a "next 2 PM" countdown is wrong on every
+    # host. Return the honest unknown marker instead (matches the main path's
+    # "--" at the resets_at-absent branch).
+    return "--"
 
-    total_minutes = int(diff.total_seconds() / 60)
-    hours = total_minutes // 60
-    mins = total_minutes % 60
-    return f"{hours}h {mins:02d}m"
+# Auto-update is rate-limited to once per machine every 6 hours (a day let a
+# release take up to 24h of Claude Code use to arrive; 4 checks a day stays far
+# below GitHub's 60/hour unauthenticated limit even behind a shared IP). We use the mtime
+# of `last_update_check` as the timestamp — touching it before the slow
+# urlopen+pip work means N concurrent new sessions only fire ONE check
+# (the first one to win the touch race; the rest see a fresh mtime and skip).
+_UPDATE_CHECK_INTERVAL_S = 6 * 3600
+
+
+_ENSURE_STATUSLINE_INTERVAL_S = 24 * 60 * 60  # once per day
+
+
+def _maybe_ensure_statusline():
+    """Throttle settings.json check to once per day.
+
+    `ensure_statusline_configured()` reads + parses settings.json on every
+    render — and importing setup pulls in cache + atomic_write_text. At 1Hz
+    refresh that's pure waste; settings rarely change. Use a timestamp marker
+    like check_for_updates does, so the heavy imports only happen on the
+    daily tick.
+    """
+    try:
+        cache_dir = Path.home() / '.cache' / 'claude-statusbar'
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        marker = cache_dir / 'last_statusline_check'
+        if marker.exists():
+            try:
+                if _time_now() - marker.stat().st_mtime < _ENSURE_STATUSLINE_INTERVAL_S:
+                    return
+            except OSError:
+                pass
+        marker.touch()
+    except OSError:
+        pass
+    try:
+        from .setup import ensure_statusline_configured
+        ensure_statusline_configured()
+    except Exception:
+        pass
 
 
 def check_for_updates(session_id: str = ''):
-    """Kick off a background update check once per new session.
-
-    MUST return quickly — this runs synchronously in the statusline's hot
-    path. The actual HTTP fetch and `uv tool install --upgrade` happen in
-    a detached subprocess, so Claude Code's startup never waits on PyPI.
-    Any upgrade takes effect silently at the next statusline invocation.
+    """Check for updates at most once per machine per 6 hours.
 
     Disabled by setting env CLAUDE_STATUSBAR_NO_UPDATE=1 or
     passing --no-auto-update on the CLI.
+
+    Concurrency notes
+    -----------------
+    Previously this was gated by session_id, so opening 5 new Claude Code
+    windows simultaneously would fire 5 parallel pip installs. The timestamp
+    gate fixes that: whichever cs gets to update the timestamp first wins;
+    everyone else sees a fresh marker and bails before running urlopen / pip.
     """
-    # Respect opt-out
     env_val = os.environ.get('CLAUDE_STATUSBAR_NO_UPDATE', '').lower()
     if env_val in ('1', 'true', 'yes'):
         return
 
     try:
+        from .config import load_config
+        if not load_config().auto_upgrade:
+            return
+    except Exception:
+        pass  # a broken config must never wedge the update check
+
+    try:
         cache_dir = Path.home() / '.cache' / 'claude-statusbar'
         cache_dir.mkdir(parents=True, exist_ok=True)
-        last_session_file = cache_dir / 'last_update_session'
+        marker = cache_dir / 'last_update_check'
 
-        # Skip if we've already kicked off a check for this session.
-        if session_id and last_session_file.exists():
+        # Skip if last check was within the interval.
+        if marker.exists():
             try:
-                if last_session_file.read_text().strip() == session_id:
+                age = _time_now() - marker.stat().st_mtime
+                if age < _UPDATE_CHECK_INTERVAL_S:
                     return
             except OSError:
                 pass
 
-        # Claim the session marker BEFORE spawning so concurrent statusline
-        # invocations during the same startup burst don't fire duplicate
-        # background checks (which would race on `uv tool install`).
-        if session_id:
-            try:
-                last_session_file.write_text(session_id)
-            except OSError:
-                pass
+        # Touch the marker BEFORE the slow operation. Two consequences:
+        #   1. A hung urlopen/pip can't trap us in a re-trigger loop on
+        #      next render — the marker is already fresh.
+        #   2. Concurrent sessions that arrive a few ms later see the
+        #      fresh mtime and skip. (Race window is tiny but exists; if
+        #      it matters we'd switch to fcntl.flock.)
+        try:
+            marker.touch()
+        except OSError:
+            return  # if we can't even touch the marker, don't try the upgrade
 
-        from .updater import spawn_update_check_background
-        spawn_update_check_background()
+        # Spawn the check+upgrade in a DETACHED subprocess — never run it
+        # synchronously here. A `uv tool install --upgrade` can take tens of
+        # seconds; doing it inline would freeze this render. The marker is
+        # already touched above, so we won't re-trigger before the interval.
+        from .updater import spawn_background_upgrade_check
+        spawn_background_upgrade_check()
 
     except Exception:
-        # Never let an update-check error bubble up into the statusline.
+        # Silently fail - don't interrupt main functionality
         pass
+
+
+def _time_now() -> float:
+    """Indirection so tests can monkeypatch."""
+    import time as _t
+    return _t.time()
+
+
+# Claude Code's stock context window (tokens). Only used when the env vars
+# below override the stdin-reported size — never as a default size.
+_STOCK_CONTEXT_WINDOW = 200_000
+
+
+def _env_context_window_override(reported_size: float, env=None) -> Optional[int]:
+    """Max context window forced via Claude Code's own env vars, or None.
+
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW=<tokens> wins outright (#29 — Claude Code
+    honors it, but statusLine stdin keeps reporting the stock size, so ctx%
+    reads wrong without this). A truthy CLAUDE_CODE_DISABLE_1M_CONTEXT caps a
+    reported >200K window back to the stock 200K. Empty/invalid values return
+    None → keep the stdin-reported size (current behavior).
+
+    Keys absent from a stamped session env fall back to os.environ: render_thin
+    only stamps the API-mode keys into `_cs_env`, and these vars are global
+    config (settings.json env / shell profile) that the daemon inherits anyway.
+    """
+    source = os.environ if env is None else env
+
+    def _get(key):
+        v = source.get(key)
+        if v is None and source is not os.environ:
+            v = os.environ.get(key)
+        return v
+
+    raw = str(_get('CLAUDE_CODE_AUTO_COMPACT_WINDOW') or '').strip()
+    if raw:
+        try:
+            val = int(raw)
+        except ValueError:
+            val = 0
+        if val > 0:
+            return val
+    if (_env_truthy(_get('CLAUDE_CODE_DISABLE_1M_CONTEXT') or '')
+            and reported_size > _STOCK_CONTEXT_WINDOW):
+        return _STOCK_CONTEXT_WINDOW
+    return None
+
+
+def _token_count(value) -> Optional[int]:
+    """A nonnegative integer token count, rejecting bools/floats/strings."""
+    if type(value) is not int or value < 0:
+        return None
+    return value
+
+
+def _exact_used_tokens(stdin_data: Dict[str, Any]) -> Optional[int]:
+    """Authoritative input-side context tokens from current_usage, or None.
+
+    None is "no authoritative signal", never zero: the key may be absent
+    (fresh tick, old Claude Code), an explicit null (lifecycle sentinel
+    right after /compact), or malformed. Callers fall back to the
+    cross-checked totals, then to the reported percentage.
+    """
+    if 'context_current_usage' not in stdin_data:
+        return None
+    current = stdin_data.get('context_current_usage')
+    if current is None or not isinstance(current, dict):
+        return None
+    total = 0
+    for key in ('input_tokens', 'cache_creation_input_tokens',
+                'cache_read_input_tokens'):
+        raw = current.get(key, 0)
+        count = _token_count(raw)
+        if count is None:
+            return None
+        total += count
+    return total
+
+
+# used_percentage is an integer percentage, so an honest totals reading can
+# sit up to ~1% off it; a little slack on top covers the two fields being
+# captured a tick apart. Anything further out means totals do not describe
+# the current context at all.
+_TOTALS_PCT_TOLERANCE = 1.5
+
+
+def _cross_checked_totals(stdin_data: Dict[str, Any], size: float,
+                          pct: Optional[float]) -> Optional[int]:
+    """total_input_tokens, but only when it agrees with used_percentage.
+
+    Totals silently change meaning across Claude Code versions and lifecycle
+    ticks — 2.1.220 still sends the cumulative session counter (tens of
+    millions on a long session) on the first ticks of a resume, before
+    current_usage appears. A version gate can't track that, so totals are
+    believed only when consistent with the percentage Claude Code itself
+    displays; otherwise the caller derives tokens from that percentage.
+    """
+    total = _token_count(stdin_data.get('total_input_tokens'))
+    if total is None or pct is None:
+        return None
+    if abs(total / size * 100.0 - pct) <= _TOTALS_PCT_TOLERANCE:
+        return total
+    return None
+
+
+def _context_window_usage(stdin_data: Dict[str, Any],
+                          env=None) -> Tuple[Optional[float], int, Optional[int]]:
+    """Return (ctx_pct, ctx_size, ctx_used) for renderer/model suffix.
+
+    Claude sometimes sends null for context_window.used_percentage. Treat that
+    as unknown instead of falling into the expensive reset-time fallback.
+
+    `env` is the session's effective environment (daemon renders pass the
+    per-session env stamped by render_thin; None → os.environ). It carries the
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW / CLAUDE_CODE_DISABLE_1M_CONTEXT overrides.
+    """
+    explicit_null = ('context_current_usage' in stdin_data
+                     and stdin_data.get('context_current_usage') is None)
+    if explicit_null:
+        from .context_state import reset
+        reset(stdin_data.get('session_id', ''), CTX_STATE_FILE)
+
+    raw_size = stdin_data.get('context_window_size', 0)
+    try:
+        ctx_size_f = float(raw_size)
+    except (TypeError, ValueError):
+        ctx_size_f = 0
+    if ctx_size_f <= 0:
+        from .context_state import smooth
+        used, size = smooth(stdin_data.get('session_id', ''), None, 0,
+                            CTX_STATE_FILE)
+        if used is not None and size:
+            return used / size * 100.0, size, used
+        return None, 0, 0
+
+    raw_pct = stdin_data.get('context_used_pct', 0)
+    try:
+        ctx_pct = float(raw_pct)
+    except (TypeError, ValueError):
+        ctx_pct = None
+
+    # Exact totals beat the integer percentage. Claude Code reports
+    # used_percentage as a whole number, so deriving tokens from it quantises
+    # the readout to 1% of the window — 2k on a 200k model (invisible), but
+    # 10k on a 1M-context one, where the bar steps 60.0k → 70.0k and can sit
+    # ~10k off the truth. `ctx_pct` itself stays as reported so the percentage
+    # and its severity colour keep matching what Claude Code shows.
+    #
+    # Trust order: current_usage (authoritative, may honestly exceed the
+    # window while a compact is pending) → totals cross-checked against the
+    # percentage → the percentage itself → None ("unknown", renders as no
+    # suffix rather than a made-up 0).
+    ctx_used = _exact_used_tokens(stdin_data)
+    if ctx_used is None:
+        ctx_used = _cross_checked_totals(stdin_data, ctx_size_f, ctx_pct)
+    if ctx_used is None:
+        ctx_used = int(ctx_size_f * ctx_pct / 100) if ctx_pct is not None else None
+
+    # Env override (#29): used tokens stay what stdin reported; the window and
+    # the percentage are re-derived against the real (env-forced) size.
+    override = _env_context_window_override(ctx_size_f, env)
+    if override is not None and override != int(ctx_size_f):
+        if ctx_pct is not None and ctx_used is not None:
+            ctx_pct = ctx_used / override * 100.0
+        ctx_size_f = float(override)
+    # An explicit null with no other trustworthy reading is a post-compact
+    # unknown sentinel, not a missing gateway sample; never resurrect old usage.
+    unknown_sentinel = explicit_null and ctx_used is None
+    if not unknown_sentinel:
+        from .context_state import smooth
+        used, size = smooth(stdin_data.get('session_id', ''), ctx_used,
+                            int(ctx_size_f), CTX_STATE_FILE)
+        if used is not None and size:
+            if used != ctx_used or size != int(ctx_size_f):
+                ctx_pct = used / size * 100.0
+            ctx_size_f = float(size)
+            ctx_used = used
+    return ctx_pct, int(ctx_size_f), (int(ctx_used) if ctx_used is not None else None)
 
 
 def format_number(num: float) -> str:
     """Format number for detail display."""
+    if num >= 1_000_000_000:
+        return f"{num/1_000_000_000:.1f}B"
     if num >= 1_000_000:
         return f"{num/1_000_000:.1f}M"
     elif num >= 1_000:
@@ -750,29 +987,505 @@ def format_number(num: float) -> str:
     return f"{num:.0f}"
 
 
+# Reverse-tail reader tunables. 32KB per seek, capped at 10 chunks (320KB)
+# so a multi-MB transcript with no assistant entries can't blow up render time.
+_CACHE_AGE_CHUNK = 32 * 1024
+_CACHE_AGE_MAX_BYTES = 10 * _CACHE_AGE_CHUNK
+# Conservative fallback when the transcript carries no cache-write signal
+# (caching disabled, or a transcript old enough to predate the
+# cache_creation breakdown). Under-promising (early COLD) beats claiming a
+# dead cache is warm. Anthropic's own base default is also 5 minutes.
+_FALLBACK_TTL_S = 300
+
+
+def _entry_age(entry: Dict[str, Any]) -> Optional[float]:
+    """Seconds since this transcript entry's timestamp, or None if absent/bad."""
+    ts_str = entry.get("timestamp", "")
+    if not isinstance(ts_str, str) or not ts_str:
+        return None
+    if ts_str.endswith("Z"):
+        ts_str = ts_str[:-1] + "+00:00"
+    try:
+        last_ts = datetime.fromisoformat(ts_str)
+    except ValueError:
+        return None
+    # Treat naive timestamps as UTC (Claude Code convention) to avoid
+    # TypeError on aware-minus-naive subtraction.
+    if last_ts.tzinfo is None:
+        last_ts = last_ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - last_ts).total_seconds()
+
+
+def _entry_cache_ttl(entry: Dict[str, Any]) -> Optional[int]:
+    """The prompt-cache TTL Anthropic actually applied on this turn, in seconds.
+
+    Read from `message.usage.cache_creation`, which buckets cache-WRITE tokens
+    by TTL. A nonzero `ephemeral_1h_input_tokens` means the request used a
+    1-hour `cache_control` ttl; `ephemeral_5m_input_tokens` means 5 minutes.
+    Returns None when this turn wrote nothing to cache (both buckets 0/absent).
+    """
+    msg = entry.get("message")
+    if not isinstance(msg, dict):
+        return None
+    usage = msg.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    cc = usage.get("cache_creation")
+    if not isinstance(cc, dict):
+        return None
+    if (cc.get("ephemeral_1h_input_tokens") or 0) > 0:
+        return 3600
+    if (cc.get("ephemeral_5m_input_tokens") or 0) > 0:
+        return 300
+    return None
+
+
+_ASSISTANT_SNAPSHOTS = {}
+
+
+def _last_assistant_info(transcript_path: str) -> Optional[Tuple[float, Optional[int]]]:
+    from time import time as clock
+    try:
+        st = os.stat(transcript_path)
+        sig = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    except OSError:
+        return None
+    now = clock()
+    cached = _ASSISTANT_SNAPSHOTS.get(transcript_path)
+    if cached and cached[0] == sig:
+        result = cached[2]
+        return None if result is None else (result[0] + now - cached[1], result[1])
+    result = _last_assistant_info_uncached(transcript_path)
+    if len(_ASSISTANT_SNAPSHOTS) >= 128:
+        _ASSISTANT_SNAPSHOTS.pop(next(iter(_ASSISTANT_SNAPSHOTS)))
+    _ASSISTANT_SNAPSHOTS[transcript_path] = (sig, now, result)
+    return result
+
+
+def _last_assistant_info_uncached(transcript_path: str) -> Optional[Tuple[float, Optional[int]]]:
+    """Return (age_seconds, detected_ttl) for the prompt-cache countdown.
+
+    - age          ← timestamp of the NEWEST assistant entry (the most recent
+                     cache touch).
+    - detected_ttl ← the real TTL Anthropic applied, read from the newest
+                     assistant entry that actually WROTE cache (see
+                     `_entry_cache_ttl`). None if no write signal exists within
+                     the byte budget (caching disabled / ancient transcript).
+
+    age and ttl are decoupled on purpose: a final read-only turn (both buckets
+    0) keeps its age but falls through to the last turn that wrote cache, so
+    the detected TTL isn't erased by a turn that happened to write nothing.
+
+    Both are gathered in ONE reverse-tail pass (32KB chunks, capped at
+    _CACHE_AGE_MAX_BYTES) — these files run to many MB and the status bar
+    renders on every turn. Returns as soon as both are known.
+    """
+    age: Optional[float] = None
+    ttl: Optional[int] = None
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(0, 2)
+            file_size = f.tell()
+            if file_size == 0:
+                return None
+            buf = b""
+            pos = file_size
+            scanned = 0
+            while pos > 0 and scanned < _CACHE_AGE_MAX_BYTES:
+                read = min(_CACHE_AGE_CHUNK, pos)
+                pos -= read
+                scanned += read
+                f.seek(pos)
+                # Prepend the new chunk; reversal order matters — the newer
+                # bytes already in `buf` are at higher offsets than what we
+                # just read.
+                buf = f.read(read) + buf
+                lines = buf.split(b"\n")
+                # Unless we've reached the file start, the first line may be
+                # a partial — keep it in buf for the next iteration to stitch.
+                if pos > 0:
+                    buf = lines[0]
+                    candidates = lines[1:]
+                else:
+                    buf = b""
+                    candidates = lines
+                for raw in reversed(candidates):
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        entry = json.loads(raw)
+                    except (ValueError, json.JSONDecodeError):
+                        continue
+                    if entry.get("type") != "assistant":
+                        continue
+                    # age: first (newest) assistant entry with a usable timestamp.
+                    if age is None:
+                        age = _entry_age(entry)
+                    # ttl: first (newest) assistant entry that wrote cache.
+                    if ttl is None:
+                        ttl = _entry_cache_ttl(entry)
+                    if age is not None and ttl is not None:
+                        return (age, ttl)
+    except OSError:
+        return None
+    if age is None:
+        return None
+    return (age, ttl)
+
+
+def _last_assistant_age(transcript_path: str) -> Optional[float]:
+    """Age in seconds of the most recent assistant entry, or None.
+
+    Thin wrapper over `_last_assistant_info` — kept for callers/tests that
+    only need the age.
+    """
+    info = _last_assistant_info(transcript_path)
+    return info[0] if info is not None else None
+
+
+def get_cache_age_text(ttl_seconds: Optional[int] = None,
+                       transcript_path: Optional[str] = None) -> str:
+    """Return cache state as a COUNTDOWN to expiry.
+
+    Display semantics:
+      - "Xm YYs" / "Ys" — time remaining before Anthropic's prompt cache
+        expires. Decreasing number = increasing urgency, matching the
+        `⏰2h14m` reset countdowns elsewhere on the line.
+      - "COLD"          — cache has expired (or transcript has no
+        assistant entry). Next API call pays full input-token price.
+      - ""              — no signal at all (no last_stdin.json or
+        no transcript_path); segment hidden.
+
+    The TTL is AUTO-DETECTED from the transcript (`_last_assistant_info`):
+    Anthropic reports, on every turn, which TTL it applied to the cache write
+    (5m vs 1h). That ground truth already reflects subscription-vs-API-key
+    auth, ENABLE_PROMPT_CACHING_1H, FORCE_PROMPT_CACHING_5M, and the
+    over-quota → 5m downgrade — so no static config can do better. When the
+    transcript carries no write signal we fall back to `_FALLBACK_TTL_S`.
+
+    `ttl_seconds` is an explicit override (testing / edge cases); production
+    leaves it None so the TTL is detected. The legacy `cache_ttl_seconds`
+    config is no longer consulted.
+
+    Why countdown not elapsed: the widget exists to answer "should I send
+    my next prompt before the cache dies?". A countdown answers directly;
+    elapsed forces the user to mentally subtract.
+    """
+    cache_file = Path.home() / ".cache" / "claude-statusbar" / "last_stdin.json"
+
+    if transcript_path is None:
+        try:
+            raw = json.loads(cache_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError, FileNotFoundError):
+            return ""
+        tp = raw.get("transcript_path", "")
+    else:
+        tp = transcript_path
+    if not tp:
+        return ""
+    info = _last_assistant_info(tp)
+    if info is None:
+        return "COLD"
+    age_s, detected_ttl = info
+    # Formatting (countdown + clock-skew clamp + COLD) is shared with the
+    # merged single-scan render path so both produce identical output.
+    from .activity import format_cache_countdown
+    return format_cache_countdown(age_s, detected_ttl, ttl_seconds)
+
+
 def main(json_output: bool = False,
          reset_hour: Optional[int] = None, use_color: bool = True,
-         detail: bool = False, pet_name: Optional[str] = None,
-         show_pet: bool = True,
-         warning_threshold: float = 30.0, critical_threshold: float = 70.0,
-         show_git: bool = True):
+         detail: bool = False,
+         warning_threshold: Optional[float] = None,
+         critical_threshold: Optional[float] = None,
+         style_override: Optional[str] = None,
+         theme_override: Optional[str] = None,
+         show_git: bool = True,
+         _suppress_side_effects: bool = False):
+    """Main render entry point.
+
+    `_suppress_side_effects` is set by the daemon mode (Phase B): when the
+    long-lived daemon is doing the rendering, we don't want it firing the
+    per-render auto-update / settings-repair checks (those run on their own
+    cadence elsewhere, and the daemon shouldn't accidentally re-trigger them
+    1Hz).
+    """
     """Main function"""
-    from .pet import format_pet
+    from . import config as _cfg
+    # Heavier imports (.styles + .themes + .progress) happen lazily below
+    # because they only matter once we actually start rendering — many
+    # config-info paths return early.
+
+    cfg = _cfg.load_config()
+    # Severity thresholds resolve explicit-arg → config → default. Callers
+    # (cli.py / render_thin / daemon) pass None when no flag/env was given, so
+    # the persisted `cs config set warning_threshold` actually drives the bar.
+    # Defensive: a malformed pair must never crash the statusLine — fall back
+    # to the safe default (config set-time validation makes this unreachable
+    # in practice, but the render path is load-bearing).
+    from .progress import normalize_thresholds as _norm_thresh
+    try:
+        warning_threshold, critical_threshold = _norm_thresh(
+            warning_threshold if warning_threshold is not None
+            else cfg.warning_threshold,
+            critical_threshold if critical_threshold is not None
+            else cfg.critical_threshold,
+        )
+    except (ValueError, TypeError):
+        warning_threshold, critical_threshold = _norm_thresh(None, None)
+    chosen_style = _cfg.resolve_style(style_override, cfg)
+    from .styles import is_known_style as _is_known_style, render as _render_style
+    if not _is_known_style(chosen_style):
+        # Unknown style (or capsule / hairline, removed in 3.50.0) → silently
+        # fall back to the default rather than explode in the statusLine where
+        # the user can't see the error.
+        chosen_style = "aurora"
+    from .themes import get_theme, apply_color_overrides, parse_hex_color
+    from .progress import get_countdown_emoji
+    chosen_theme = get_theme(_cfg.resolve_theme(theme_override, cfg))
+    # Layer per-severity color overrides on top of the theme. cfg fields are
+    # already canonical "#rrggbb" strings (validated at set_value time), so
+    # parse_hex_color never raises here. None fields stay as the theme default.
+    chosen_theme = apply_color_overrides(
+        chosen_theme,
+        ok=parse_hex_color(cfg.color_ok) if cfg.color_ok else None,
+        warn=parse_hex_color(cfg.color_warn) if cfg.color_warn else None,
+        hot=parse_hex_color(cfg.color_hot) if cfg.color_hot else None,
+        worktree=parse_hex_color(cfg.color_worktree) if cfg.color_worktree else None,
+    )
+
     stdin_data = parse_stdin_data()
 
-    # Resolve git branch/worktree once per render. Deferred import keeps
-    # the cold path free of git_info when the user opts out.
-    if show_git:
-        from .git_info import get_git_info
-        git_info_result = get_git_info(stdin_data.get('cwd'))
+    # No-quota mode (third-party relay / Bedrock / Vertex): official 5h/7d quota
+    # is structurally unavailable. Suppress any cached quota that parse_stdin_data
+    # may have backfilled — it belongs to a previous official session/account, not
+    # this relay session — so has_official stays False and the no-quota layout
+    # (context bar + activity) owns the render instead of leaking stale numbers.
+    # Prefer the per-session env stamped by render_thin over os.environ: under
+    # the shared daemon, os.environ is the daemon's frozen start-time env, not
+    # this session's, so reading it would mis-detect no-quota mode per session.
+    _session_env = stdin_data.get('_session_env')
+    _effective_env = _session_env if isinstance(_session_env, dict) else os.environ
+    show_git = show_git and not _env_truthy(
+        _effective_env.get("CLAUDE_STATUSBAR_NO_GIT"))
+    from ._display import clip_lines as _clip_lines
+    from ._display import terminal_width as _terminal_width
+    max_width = _terminal_width(_effective_env)
+    _api_mode = _cfg.resolve_api_mode(cfg, env=_effective_env)
+    no_quota = is_no_quota_mode(_effective_env, override=_api_mode)
+    # Heuristic fallback only when the env signal missed (and not force-disabled):
+    # an assistant turn exists yet no quota ever arrived → relay stripping headers.
+    # Gated tightly (no live/cached quota) so the tail scan only runs when unsure;
+    # official users keep their cached quota and skip both the scan and the switch.
+    if (not no_quota and _api_mode != 'off'
+            and not stdin_data.get('_kimi_quota')
+            and stdin_data.get('_has_stdin')
+            and stdin_data.get('rate_limit_pct') is None
+            and stdin_data.get('rate_limit_7d_pct') is None):
+        no_quota = _no_quota_heuristic(
+            stdin_data,
+            transcript_has_assistant=_transcript_has_assistant(
+                stdin_data.get('transcript_path', '')),
+            claude_version_ok=_claude_emits_rate_limits(
+                stdin_data.get('claude_version')),
+        )
+    if no_quota:
+        stdin_data['rate_limit_pct'] = None
+        stdin_data['rate_limit_7d_pct'] = None
+    if stdin_data.get('_kimi_quota') and not no_quota:
+        kimi_limits(_effective_env)
+
+    if cfg.show_language:
+        from .progress import format_language_body
+        lang_body = format_language_body(
+            str(Path.home() / ".claude" / "language-progress.json"),
+        )
     else:
-        git_info_result = None
-    git_branch = git_info_result.branch if git_info_result else None
-    git_worktree = git_info_result.worktree if git_info_result else None
+        lang_body = ""
+
+    # Optional session cost segment.
+    cost_text = ""
+    if cfg.show_cost:
+        sc = stdin_data.get("session_cost_usd")
+        if isinstance(sc, (int, float)) and sc >= 0:
+            cost_text = f"{sc:.2f}"
+
+    # ONE transcript tail-scan serves BOTH the activity line and the prompt-
+    # cache countdown: read_activity also returns cache_age_seconds/cache_ttl.
+    # When the activity line isn't wanted, fall back to the lean early-exit
+    # cache reader (get_cache_age_text) so a cache-only render stays cheap.
+    _want_scan = cfg.show_todos or cfg.show_tools or cfg.show_agents
+    _tp = stdin_data.get("transcript_path", "")
+    activity = None
+    if _want_scan and _tp:
+        from .activity import read_activity
+        # Runs BEFORE main()'s big try/except — guard so a scanner failure
+        # degrades to "no activity line" instead of blanking the whole bar.
+        try:
+            activity = read_activity(_tp)
+        except Exception:
+            activity = None
+
+    # Optional cache age segment — from the shared scan when we did one, else
+    # the standalone reader (cache-only render, no transcript, or scan failed).
+    cache_age_text = ""
+    if cfg.show_cache_age:
+        _expires_at = stdin_data.get("prompt_cache_expires_at")
+        if _expires_at is not None:
+            import time as _t
+            from .activity import format_cache_remaining
+            cache_age_text = format_cache_remaining(_expires_at - _t.time())
+        elif activity is not None:
+            from .activity import format_cache_countdown
+            cache_age_text = format_cache_countdown(
+                activity.cache_age_seconds, activity.cache_ttl)
+        else:
+            cache_age_text = get_cache_age_text(transcript_path=_tp)
+
+    # Experimental bar shimmer: a phase that advances one cell per render.
+    # Capped at the statusLine's ~1Hz refresh, so it's a slow step. classic only.
+    shimmer_phase = None
+    if cfg.bar_shimmer:
+        import time as _t
+        shimmer_phase = int(_t.time())
+
+    # Cheap session stats from stdin (no transcript scan). Rendered on the
+    # identity line — next to the project — rather than alone on the activity
+    # line. (They therefore appear only when show_project_branch is on.)
+    from .activity import format_duration_short, format_lines
+    duration_text = (format_duration_short(stdin_data.get("total_duration_ms", 0))
+                     if cfg.show_duration else "")
+    lines_text = (format_lines(stdin_data.get("lines_added", 0),
+                               stdin_data.get("lines_removed", 0))
+                  if cfg.show_lines else "")
+
+    # Optional project + branch identity segment (second line). Also carries
+    # the "new looks · cs theme" nudge, since every render path spreads it.
+    identity_kwargs = {"looks_hint": cfg.looks_seen < _cfg.LOOKS_VERSION,
+                       "narrow_layout": cfg.narrow_layout}
+    if cfg.show_project_branch:
+        from .identity import resolve_identity, dirty_with_async_refresh
+        info = resolve_identity(stdin_data, include_git=show_git)
+        dirty = dirty_with_async_refresh(info.toplevel) if info.toplevel else None
+        identity_kwargs.update(
+            show_project_branch=True,
+            identity=info,
+            identity_dirty=dirty,
+            identity_duration=duration_text,
+            identity_lines=lines_text,
+            identity_show_version=cfg.show_version,
+            worktree_glyph=cfg.worktree_glyph,
+        )
+        # git ahead/behind reuses the same cached `git status --branch` the
+        # dirty refresh just triggered — only meaningful on the identity line.
+        if cfg.show_ahead_behind and info.toplevel:
+            from .identity import read_ahead_behind
+            ahead, behind = read_ahead_behind(info.toplevel)
+            identity_kwargs["identity_ahead"] = ahead
+            identity_kwargs["identity_behind"] = behind
+    if cfg.show_per_model and not no_quota and not stdin_data.get('_kimi_quota'):
+        from .scoped_usage import cached_limits
+        identity_kwargs['per_model_limits'] = cached_limits(spawn=_suppress_side_effects)
+        identity_kwargs['per_model_projection'] = cfg.show_projection
+    # Optional working-directory segment (#30): workspace.current_dir (falling
+    # back to cwd — parse_stdin_data flattens both into workspace_current_dir).
+    # Zero extra I/O: the data is already in the statusLine stdin. Rides the
+    # identity line when that line is on; else gets its own minimal `⤷` line.
+    from .i18n import ui_lang as _ui_lang
+    cwd_kwargs = {"ui_lang": _ui_lang(cfg.lang)}
+    if cfg.show_cwd:
+        _raw_cwd = str(stdin_data.get('workspace_current_dir') or '')
+        if _raw_cwd:
+            if cfg.cwd_style == "full":
+                cwd_kwargs = {**cwd_kwargs, "cwd_text": _raw_cwd}
+            else:
+                # basename (default); rstrip so "/repos/proj/" → "proj"
+                cwd_kwargs = {**cwd_kwargs, "cwd_text":
+                              os.path.basename(_raw_cwd.rstrip('/')) or _raw_cwd}
+
+    # Optional ocs line (address, unread DMs, LAN state): reads a per-session
+    # cache; a stale entry triggers a background refresh — never blocks the render.
+    if cfg.show_ocs:
+        try:
+            from .ocs import ocs_label, ocs_status
+            _sid = str(stdin_data.get('session_id') or '')
+            _ocs = ocs_label(_sid)
+            if _ocs:
+                _st = ocs_status(_sid)
+                cwd_kwargs = {**cwd_kwargs, "ocs_text": _ocs,
+                              "ocs_unread": _st["unread"], "ocs_lan": _st["lan"]}
+        except Exception:
+            pass
+
+    # Dedicated egress-IP risk warning line (only shows above the risk
+    # threshold; independent of the git identity segment).
+    ip_line_kwargs = {}
+    if cfg.show_ip_risk:
+        try:
+            from .ip_risk import ip_risk_finding
+            ip_finding, ip_level = ip_risk_finding()
+            if ip_finding:
+                ip_line_kwargs = {"ip_line_text": ip_finding.legacy,
+                                  "ip_line_level": ip_level,
+                                  "ip_finding": ip_finding}
+        except Exception:
+            pass
+
+    # Local custom-endpoint notice. No watermark, timezone or account inference.
+    fp_line_kwargs = {}
+    if cfg.show_fp_risk:
+        try:
+            from .fp_risk import fp_risk_finding
+            fp_finding = fp_risk_finding(_effective_env)
+            if fp_finding:
+                fp_line_kwargs = {"fp_line_text": fp_finding.legacy,
+                                  "fp_line_level": "warn",
+                                  "fp_finding": fp_finding}
+        except Exception:
+            pass
+
+    # Optional session-mode line (⚙): effort / thinking / fast / output-style,
+    # straight from stdin. Each field is omitted by the renderer when absent.
+    # Compact model-attached badge is always live; the separate ⚙ line remains
+    # an independent opt-in for output-style and expanded mode details.
+    mode_kwargs = dict(
+        effort_level=stdin_data.get('effort_level', ''),
+        thinking_enabled=stdin_data.get('thinking_enabled'),
+        fast_mode=stdin_data.get('fast_mode'),
+    )
+    if cfg.show_mode:
+        mode_kwargs.update(
+            mode_show=True,
+            mode_effort=stdin_data.get('effort_level', ''),
+            mode_thinking=stdin_data.get('thinking_enabled'),
+            mode_fast=stdin_data.get('fast_mode'),
+            mode_style=stdin_data.get('output_style', ''),
+            mode_gradient=cfg.mode_gradient,
+        )
+
+    # Optional live-activity line (3rd line): todos / active tool + rollup.
+    # Subagents (show_agents) render on their own bottom line(s). Reuses the
+    # single `activity` scan done above.
+    activity_kwargs = {}
+    if _want_scan:
+        activity_kwargs = dict(
+            activity=activity,
+            activity_opts=dict(
+                show_todos=cfg.show_todos,
+                show_tools=cfg.show_tools,
+                show_tool_rollup=cfg.show_tool_rollup,
+                show_agents=cfg.show_agents,
+            ),
+        )
 
     try:
-        if not json_output:
+        if not json_output and not _suppress_side_effects:
             check_for_updates(stdin_data.get('session_id', ''))
+            # Silently restore statusLine config if a Claude Code upgrade wiped
+            # it. Throttled to once per day — settings.json doesn't change
+            # often, and at 1Hz refresh the read+parse adds up.
+            _maybe_ensure_statusline()
 
         has_official = (stdin_data.get('rate_limit_pct') is not None or
                         stdin_data.get('rate_limit_7d_pct') is not None)
@@ -780,12 +1493,98 @@ def main(json_output: bool = False,
         model_id, display_name = get_current_model(stdin_data)
         bypass = is_bypass_permissions_active()
 
-        if has_official:
+        if no_quota and stdin_data.get('_has_stdin'):
+            # 🔌 No-quota mode: third-party relay / Bedrock / Vertex. No official
+            # 5h/7d quota exists, so drop the quota bars and promote the context
+            # window to its own battery bar, mirroring claude-hud. Activity tail
+            # (todos/tools/agents) is appended by the style renderer as usual.
+            ctx_pct, ctx_size, ctx_used = _context_window_usage(
+                stdin_data, env=_effective_env)
+            model = display_name if display_name != 'Unknown' else model_id
+            # Replace any static size suffix with the live used/total reading.
+            import re as _re
+            model = _re.sub(r'\s*\([^)]*context[^)]*\)', '', model)
+            if ctx_size > 0 and ctx_used is not None:
+                model = f"{model}({format_number(ctx_used)}/{format_number(ctx_size)})"
+
+            # Optional relay account balance — only meaningful in no-quota mode
+            # (third-party relay). Self-hides when the relay exposes no billing
+            # endpoint. The probe runs in a detached process (like the git
+            # dirty-state refresh), so it spawns under both the inline and
+            # daemon render paths — _suppress_side_effects gates the per-render
+            # auto-update checks, not background data refreshes.
+            #
+            # When balance_bar is on AND the relay reports a usable hard_limit,
+            # the segment renders as a fuel-gauge battery (fill = remaining %),
+            # else it falls back to the plain `bal $X` text.
+            balance_text = ""
+            balance_pct = None
+            balance_amount = ""
+            if cfg.show_balance:
+                _bentry = relay_balance(_effective_env)
+                if _bentry:
+                    balance_text = _format_balance(_bentry)
+                    if cfg.balance_bar:
+                        _rp = _balance_remaining_pct(_bentry)
+                        if _rp is not None:
+                            balance_pct = _rp
+                            balance_amount = f"${_bentry['balance']:,.2f}"
+                            if _bentry.get('refresh_failed'):
+                                balance_amount += ' ⟳'
+
+            if json_output:
+                print(json.dumps({
+                    "success": True, "source": "no_quota",
+                    "context": {"used_percentage": ctx_pct,
+                                "context_window_size": ctx_size,
+                                "used_tokens": ctx_used},
+                    "balance": balance_text or None,
+                    "balance_remaining_pct": balance_pct,
+                    "meta": {"model": model_id, "display_name": display_name,
+                             "bypass": bypass},
+                }))
+            else:
+                print(_render_style(
+                    chosen_style,
+                    msgs_pct=None, weekly_pct=None,
+                    reset_5h="--", reset_7d="",
+                    model=model, lang_body=lang_body, cost_text=cost_text,
+                    bypass=bypass, cache_age_text=cache_age_text,
+                    use_color=use_color, theme=chosen_theme,
+                    warning_threshold=warning_threshold,
+                    critical_threshold=critical_threshold,
+                    density=cfg.density, bar_glyph=cfg.bar_glyph,
+                    show_weekly=cfg.show_weekly,
+                    ctx_pct=ctx_pct,
+                    shimmer_phase=shimmer_phase,
+                    max_width=max_width,
+                    no_quota=True,
+                    balance_text=balance_text,
+                    balance_pct=balance_pct,
+                    balance_amount=balance_amount,
+                    **identity_kwargs, **cwd_kwargs, **mode_kwargs, **ip_line_kwargs, **fp_line_kwargs,
+                    **activity_kwargs,
+                ))
+        elif has_official:
             # ✅ Official data from Anthropic API headers (Claude Code ≥ v2.1.80)
             msgs_pct = stdin_data.get('rate_limit_pct')
             weekly_pct = stdin_data.get('rate_limit_7d_pct')
-
             resets_at = stdin_data.get('rate_limit_resets_at')
+            resets_at_7d = stdin_data.get('rate_limit_7d_resets_at')
+
+            if not stdin_data.get('_kimi_quota'):
+                try:
+                    from .predict import reconcile_account
+                    msgs_pct, resets_at, weekly_pct, resets_at_7d = reconcile_account(
+                        msgs_pct, resets_at, weekly_pct, resets_at_7d,
+                        session_id=stdin_data.get('session_id') or None,
+                        # parse_stdin_data flattens stdin's model.id to 'model_id'
+                        model=stdin_data.get('model_id') or None,
+                        transcript_path=stdin_data.get('transcript_path') or None,
+                    )
+                except Exception:
+                    pass
+
             if resets_at:
                 diff = datetime.fromtimestamp(resets_at, tz=timezone.utc) - datetime.now(timezone.utc)
                 total_min = max(0, int(diff.total_seconds() / 60))
@@ -799,7 +1598,6 @@ def main(json_output: bool = False,
                 reset_time = "--"
                 minutes_to_reset = None
 
-            resets_at_7d = stdin_data.get('rate_limit_7d_resets_at')
             if resets_at_7d:
                 diff_7d = datetime.fromtimestamp(resets_at_7d, tz=timezone.utc) - datetime.now(timezone.utc)
                 total_sec_7d = max(0, int(diff_7d.total_seconds()))
@@ -826,46 +1624,77 @@ def main(json_output: bool = False,
                     },
                     "meta": {"model": model_id, "display_name": display_name,
                              "reset_time": reset_time, "reset_time_7d": reset_time_7d, "bypass": bypass,
-                             "effort": stdin_data.get('effort_level'),
-                             "thinking": stdin_data.get('thinking_enabled', False),
-                             "fast_mode": stdin_data.get('fast_mode', False),
                              },
                 }))
             else:
                 # Append context window usage to model name: Opus 4.6(10k/1M)
-                ctx_size = stdin_data.get('context_window_size', 0)
-                ctx_pct = stdin_data.get('context_used_pct', 0)
-                if ctx_pct and ctx_size:
-                    ctx_used = int(ctx_size * ctx_pct / 100)
-                else:
-                    ctx_used = stdin_data.get('total_input_tokens', 0) + stdin_data.get('total_output_tokens', 0)
+                ctx_pct, ctx_size, ctx_used = _context_window_usage(
+                    stdin_data, env=_effective_env)
                 if ctx_size > 0:
                     # Strip redundant size suffix like "(1M context)" from display_name
-                    model = re.sub(r'\s*\([^)]*context[^)]*\)', '', model)
-                    model = f"{model}({format_number(ctx_used)}/{format_number(ctx_size)})"
+                    import re as _re
+                    model = _re.sub(r'\s*\([^)]*context[^)]*\)', '', model)
+                    # Unknown usage (fresh tick / post-compact sentinel) shows
+                    # a bare model name — no suffix beats a made-up "(0/1.0M)".
+                    if ctx_used is not None:
+                        model = f"{model}({format_number(ctx_used)}/{format_number(ctx_size)})"
 
-                session_id = stdin_data.get('session_id', '')
-                current_hour = datetime.now().hour
-                pet_text = ""
-                if show_pet:
-                    pet_pct = msgs_pct if msgs_pct is not None else 0
-                    pet_text = format_pet(
-                        pet_pct, current_hour, session_id, minutes_to_reset, pet_name
-                    )
+                countdown = get_countdown_emoji(minutes_to_reset)
 
-                print(format_status_line(
-                    msgs_pct=msgs_pct, tkns_pct=None,
-                    reset_time=reset_time, model=model,
-                    weekly_pct=weekly_pct,
-                    reset_time_7d=reset_time_7d,
-                    bypass=bypass, use_color=use_color,
-                    pet_text=pet_text,
+                projection_kwargs = {}
+                if cfg.show_projection and not stdin_data.get('_kimi_quota'):
+                    try:
+                        import time as _t
+                        from .predict import projection
+                        p5, p7 = projection(
+                            used_5h=msgs_pct,
+                            resets_5h=resets_at,
+                            used_7d=weekly_pct,
+                            resets_7d=resets_at_7d,
+                            now=_t.time(),
+                            session_id=stdin_data.get("session_id", ""),
+                            transcript_path=stdin_data.get('transcript_path') or None,
+                        )
+                        projection_kwargs = {"projection_5h": p5 or "", "projection_7d": p7 or ""}
+                    except Exception:
+                        projection_kwargs = {}
+
+                forecast_kwargs = {}
+                if cfg.show_forecast and not stdin_data.get('_kimi_quota'):
+                    try:
+                        import time as _t
+                        from .predict import forecast
+                        f5, f7 = forecast(
+                            used_5h=msgs_pct,
+                            resets_5h=resets_at,
+                            used_7d=weekly_pct,
+                            resets_7d=resets_at_7d,
+                            now=_t.time(),
+                            transcript_path=stdin_data.get('transcript_path') or None,
+                        )
+                        forecast_kwargs = {"forecast_5h": f5 or "", "forecast_7d": f7 or ""}
+                    except Exception:
+                        forecast_kwargs = {}
+
+                print(_render_style(
+                    chosen_style,
+                    msgs_pct=msgs_pct, weekly_pct=weekly_pct,
+                    reset_5h=reset_time, reset_7d=reset_time_7d,
+                    model=model, lang_body=lang_body, cost_text=cost_text,
+                    bypass=bypass, cache_age_text=cache_age_text,
+                    use_color=use_color, theme=chosen_theme,
                     warning_threshold=warning_threshold,
                     critical_threshold=critical_threshold,
-                    effort_level=stdin_data.get('effort_level'),
-                    thinking_enabled=stdin_data.get('thinking_enabled', False),
-                    fast_mode=stdin_data.get('fast_mode', False),
-                    branch=git_branch, worktree=git_worktree,
+                    countdown_emoji=countdown,
+                    density=cfg.density, bar_glyph=cfg.bar_glyph,
+                    show_weekly=cfg.show_weekly,
+                    ctx_pct=ctx_pct,
+                    shimmer_phase=shimmer_phase,
+                    max_width=max_width,
+                    **projection_kwargs,
+                    **forecast_kwargs,
+                    **identity_kwargs, **cwd_kwargs, **mode_kwargs, **ip_line_kwargs, **fp_line_kwargs,
+                    **activity_kwargs,
                 ))
         else:
             # No rate_limits yet — could be session start or old Claude Code
@@ -873,41 +1702,59 @@ def main(json_output: bool = False,
             version = stdin_data.get('claude_version', '') if stdin_data.get('_has_stdin') else ''
 
             if stdin_data.get('_has_stdin'):
-                # Have stdin but no rate_limits — session just started, show placeholders
-                ctx_size = stdin_data.get('context_window_size', 0)
-                ctx_pct = stdin_data.get('context_used_pct', 0)
-                if ctx_pct and ctx_size:
-                    ctx_used = int(ctx_size * ctx_pct / 100)
-                else:
-                    ctx_used = stdin_data.get('total_input_tokens', 0) + stdin_data.get('total_output_tokens', 0)
+                # Have stdin but no rate_limits — session just started, OR the
+                # quota pipeline broke (statusLine displaced / daemon dead) and
+                # the cached windows rotted. Distinguish the two: a HEALTHY
+                # subscriber session that already has an assistant turn would
+                # carry rate_limits (live or cached-fresh). If instead an
+                # assistant turn exists, the client emits rate_limits, yet the
+                # quota cache is all-stale → the pipeline stopped feeding cs.
+                # Surface "stale · restart" rather than silently blank bars
+                # (the failure mode that left a Pro user staring at empty space).
+                ctx_pct, ctx_size, ctx_used = _context_window_usage(
+                    stdin_data, env=_effective_env)
+                quota_stale = False
+                if (not stdin_data.get('_kimi_quota')
+                        and _claude_emits_rate_limits(stdin_data.get('claude_version'))
+                        and _transcript_has_assistant(
+                            stdin_data.get('transcript_path', ''))):
+                    try:
+                        from .predict import quota_cache_status
+                        _st, _ = quota_cache_status()
+                        quota_stale = (_st == "stale")
+                    except Exception:
+                        quota_stale = False
                 if ctx_size > 0:
-                    model = re.sub(r'\s*\([^)]*context[^)]*\)', '', model)
-                    model = f"{model}({format_number(ctx_used)}/{format_number(ctx_size)})"
+                    import re as _re
+                    model = _re.sub(r'\s*\([^)]*context[^)]*\)', '', model)
+                    if ctx_used is not None:
+                        model = f"{model}({format_number(ctx_used)}/{format_number(ctx_size)})"
 
                 if json_output:
                     print(json.dumps({
-                        "success": True, "source": "waiting",
+                        "success": True,
+                        "source": "stale" if quota_stale else "waiting",
                         "meta": {"model": model_id, "display_name": display_name,
                                  "claude_version": version, "bypass": bypass},
                     }))
                 else:
-                    session_id = stdin_data.get('session_id', '')
-                    current_hour = datetime.now().hour
-                    pet_text = ""
-                    if show_pet:
-                        pet_text = format_pet(0, current_hour, session_id, None, pet_name)
-                    print(format_status_line(
-                        msgs_pct=None, tkns_pct=None,
-                        reset_time="--", model=model,
-                        weekly_pct=None,
-                        bypass=bypass, use_color=use_color,
-                        pet_text=pet_text,
+                    print(_render_style(
+                        chosen_style,
+                        msgs_pct=None, weekly_pct=None,
+                        reset_5h="--", reset_7d="",
+                        model=model, lang_body=lang_body, cost_text=cost_text,
+                        bypass=bypass, cache_age_text=cache_age_text,
+                        use_color=use_color, theme=chosen_theme,
                         warning_threshold=warning_threshold,
                         critical_threshold=critical_threshold,
-                        effort_level=stdin_data.get('effort_level'),
-                        thinking_enabled=stdin_data.get('thinking_enabled', False),
-                        fast_mode=stdin_data.get('fast_mode', False),
-                        branch=git_branch, worktree=git_worktree,
+                        density=cfg.density, bar_glyph=cfg.bar_glyph,
+                    show_weekly=cfg.show_weekly,
+                        ctx_pct=ctx_pct,
+                        shimmer_phase=shimmer_phase,
+                        max_width=max_width,
+                        quota_stale=quota_stale,
+                        **identity_kwargs, **cwd_kwargs, **mode_kwargs, **ip_line_kwargs, **fp_line_kwargs,
+                        **activity_kwargs,
                     ))
             else:
                 # No stdin at all — not running inside Claude Code statusLine
@@ -919,29 +1766,30 @@ def main(json_output: bool = False,
                                  "bypass": bypass},
                     }))
                 else:
-                    print(f"⚠ Run inside Claude Code statusLine for rate-limit data | {model}")
+                    warning = f"⚠ Run inside Claude Code statusLine for rate-limit data | {model}"
+                    print(_clip_lines(warning, max_width))
 
     except Exception as e:
         reset_time = calculate_reset_time(reset_hour=reset_hour).replace(" ", "")
-        model_id, display_name = get_current_model(stdin_data)
+        _, display_name = get_current_model(stdin_data)
         bypass = is_bypass_permissions_active()
         if json_output:
             print(json.dumps({"success": False, "error": str(e)}))
         else:
-            current_hour = datetime.now().hour
-            pet_text = ""
-            if show_pet:
-                pet_text = format_pet(0, current_hour, '', None, pet_name)
-            print(format_status_line(
-                msgs_pct=None, tkns_pct=None,
-                reset_time=reset_time, model=display_name,
-                weekly_pct=None,
-                bypass=bypass, use_color=use_color,
-                pet_text=pet_text,
+            print(_render_style(
+                chosen_style,
+                msgs_pct=None, weekly_pct=None,
+                reset_5h=reset_time, reset_7d="",
+                model=display_name, lang_body=lang_body, cost_text=cost_text,
+                bypass=bypass, cache_age_text=cache_age_text,
+                use_color=use_color, theme=chosen_theme,
                 warning_threshold=warning_threshold,
                 critical_threshold=critical_threshold,
+                density=cfg.density, bar_glyph=cfg.bar_glyph,
+                show_weekly=cfg.show_weekly,
+                max_width=max_width,
+                **identity_kwargs, **cwd_kwargs, **mode_kwargs, **ip_line_kwargs, **fp_line_kwargs,
             ))
-
 
 if __name__ == '__main__':
     main()

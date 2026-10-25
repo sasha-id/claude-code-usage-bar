@@ -1,66 +1,39 @@
-"""Backend-aware 5h/7d limits: default (Anthropic subscription) vs kimi-k3."""
+"""Kimi coding-plan quota parsing, caching, and backend integration."""
 import io
 import json
-import os
+import subprocess
 import sys
-import time
-from threading import Event, Thread
 
 import pytest
 
-from claude_statusbar import core
-from claude_statusbar.core import (
-    _backend,
-    _fetch_kimi_usage,
-    _kimi_usage,
-    parse_stdin_data,
-)
+
+def _kimi():
+    from claude_statusbar import kimi_usage
+    return kimi_usage
 
 
-class TestBackend:
-    def test_unset_base_url_is_default(self, monkeypatch):
-        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
-        assert _backend() == "default"
-
-    def test_empty_base_url_is_default(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_BASE_URL", "  ")
-        assert _backend() == "default"
-
-    def test_kimi_host_is_kimi(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.kimi.com/coding")
-        assert _backend() == "kimi"
-
-    def test_kimi_apex_host_is_kimi(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://kimi.com/coding")
-        assert _backend() == "kimi"
-
-    def test_kimi_host_with_trailing_whitespace_is_kimi(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_BASE_URL",
-                           "https://api.kimi.com/coding ")
-        assert _backend() == "kimi"
-
-    def test_http_kimi_host_is_not_kimi(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://api.kimi.com/coding")
-        assert _backend() == "other"
-
-    def test_lookalike_host_is_not_kimi(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://notkimi.com/v1")
-        assert _backend() == "other"
-
-    def test_other_byo_host_is_other(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://litellm.ts.sasha.id")
-        assert _backend() == "other"
-
-    def test_unparseable_base_url_is_other(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_BASE_URL", "not a url")
-        assert _backend() == "other"
-
-    def test_malformed_base_url_is_other(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://[")
-        assert _backend() == "other"
+def _cache():
+    from claude_statusbar import kimi_cache
+    return kimi_cache
 
 
-# Verified live response shape (2026-07-23), values are strings by design.
+def _refresh():
+    from claude_statusbar import _kimi_refresh
+    return _kimi_refresh
+
+
+def _core():
+    from claude_statusbar import core
+    return core
+
+
+VALID_LIMITS = {
+    "five_hour": {"pct": 16.0, "resets_at": 1784821868},
+    "seven_day": {"pct": 12.0, "resets_at": 1785336668},
+}
+
+
+# Verified live response shape (2026-07-23); numeric fields are strings.
 LIVE_PAYLOAD = {
     "usage": {"limit": "100", "used": "12", "remaining": "88",
               "resetTime": "2026-07-29T14:51:08.099871Z"},
@@ -94,504 +67,509 @@ def _mock_urlopen(monkeypatch, payload):
             calls.append((req, timeout))
             return _FakeResp(payload)
 
-    monkeypatch.setattr(core.urllib.request, "build_opener",
+    monkeypatch.setattr(_kimi().urllib.request, "build_opener",
                         lambda *handlers: _FakeOpener())
     return calls
 
 
-class TestFetchKimiUsage:
-    def test_parses_both_windows(self, monkeypatch):
-        calls = _mock_urlopen(monkeypatch, LIVE_PAYLOAD)
-        out = _fetch_kimi_usage("https://api.kimi.com/coding/", "tok")
-        assert out["seven_day"]["pct"] == pytest.approx(12.0)
-        assert out["five_hour"]["pct"] == pytest.approx(16.0)
-        # ISO resetTime converted to epoch seconds
-        assert out["seven_day"]["resets_at"] == 1785336668
-        assert out["five_hour"]["resets_at"] == 1784821868
-        # request URL + headers
-        req, timeout = calls[0]
-        assert req.full_url == "https://api.kimi.com/coding/v1/usages"
-        assert req.headers["Authorization"] == "Bearer tok"
-        assert req.headers["User-agent"] == "KimiCLI/1.6"  # Request title-cases
-        assert timeout == 2.5
-
-    def test_missing_weekly_omits_seven_day(self, monkeypatch):
-        _mock_urlopen(monkeypatch, {"limits": LIVE_PAYLOAD["limits"]})
-        out = _fetch_kimi_usage("https://api.kimi.com/coding", "tok")
-        assert "seven_day" not in out
-        assert out["five_hour"]["pct"] == pytest.approx(16.0)
-
-    def test_missing_5h_window_omits_five_hour(self, monkeypatch):
-        _mock_urlopen(monkeypatch, {"usage": LIVE_PAYLOAD["usage"], "limits": []})
-        out = _fetch_kimi_usage("https://api.kimi.com/coding", "tok")
-        assert "five_hour" not in out
-        assert out["seven_day"]["pct"] == pytest.approx(12.0)
-
-    def test_malformed_window_is_omitted_not_fatal(self, monkeypatch):
-        payload = {"usage": {"limit": "0", "used": "abc"},
-                   "limits": [{"window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
-                               "detail": {"limit": "100", "used": "16",
-                                          "resetTime": "not-a-date"}}]}
-        _mock_urlopen(monkeypatch, payload)
-        assert _fetch_kimi_usage("https://api.kimi.com/coding", "tok") == {}
-
-    def test_non_dict_window_entry_is_skipped(self, monkeypatch):
-        payload = {"usage": LIVE_PAYLOAD["usage"],
-                   "limits": [{"window": "oops", "detail": {}}]}
-        _mock_urlopen(monkeypatch, payload)
-        out = _fetch_kimi_usage("https://api.kimi.com/coding", "tok")
-        assert "five_hour" not in out
-        assert out["seven_day"]["pct"] == pytest.approx(12.0)
-
-    def test_http_url_never_sends_bearer_token(self, monkeypatch):
-        calls = _mock_urlopen(monkeypatch, LIVE_PAYLOAD)
-        with pytest.raises(ValueError, match="HTTPS"):
-            _fetch_kimi_usage("http://api.kimi.com/coding", "tok")
-        assert calls == []
-
-    def test_redirect_handler_rejects_follow_up(self):
-        handler = core._NoRedirectHandler()
-        assert handler.redirect_request(
-            None, None, 302, "Found", {}, "https://example.invalid/collect"
-        ) is None
-
-    def test_fetch_installs_no_redirect_handler(self, monkeypatch):
-        handlers = []
-
-        class _Opener:
-            def open(self, req, timeout=None):
-                return _FakeResp(LIVE_PAYLOAD)
-
-        def build_opener(*installed):
-            handlers.extend(installed)
-            return _Opener()
-
-        monkeypatch.setattr(core.urllib.request, "build_opener", build_opener)
-        monkeypatch.setattr(
-            core.urllib.request, "urlopen",
-            lambda *args, **kwargs: pytest.fail("urlopen must not be used"),
-        )
-
-        _fetch_kimi_usage("https://api.kimi.com/coding", "tok")
-
-        assert len(handlers) == 1
-        assert isinstance(handlers[0], core._NoRedirectHandler)
-
-    def test_non_finite_api_values_are_omitted(self, monkeypatch):
-        payload = {
-            "usage": {"limit": "NaN", "used": "12",
-                      "resetTime": LIVE_PAYLOAD["usage"]["resetTime"]},
-            "limits": [
-                {"window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
-                 "detail": {"limit": "100", "used": "Infinity",
-                            "resetTime": LIVE_PAYLOAD["limits"][0]["detail"]["resetTime"]}},
-            ],
-        }
-        _mock_urlopen(monkeypatch, payload)
-        assert _fetch_kimi_usage("https://api.kimi.com/coding", "tok") == {}
-
-    def test_over_limit_percentage_is_preserved(self, monkeypatch):
-        payload = {"usage": {**LIVE_PAYLOAD["usage"], "used": "120"},
-                   "limits": []}
-        _mock_urlopen(monkeypatch, payload)
-        out = _fetch_kimi_usage("https://api.kimi.com/coding", "tok")
-        assert out["seven_day"]["pct"] == pytest.approx(120.0)
-
-
-GOOD = {"five_hour": {"pct": 16.0, "resets_at": 1784821868},
-        "seven_day": {"pct": 12.0, "resets_at": 1785336668}}
+def test_fetch_parses_both_quota_windows(monkeypatch):
+    calls = _mock_urlopen(monkeypatch, LIVE_PAYLOAD)
 
+    out = _kimi().fetch_usage("https://api.kimi.com/coding/", "tok")
 
-class TestKimiUsageCache:
-    def _write_cache(self, path, age_s, limits=GOOD, base="b", token="t"):
-        path.write_text(json.dumps(
-            {"cache_key": core._kimi_cache_key(base, token),
-             "fetched_at": time.time() - age_s, "limits": limits}))
+    assert out["seven_day"]["pct"] == pytest.approx(12.0)
+    assert out["five_hour"]["pct"] == pytest.approx(16.0)
+    assert out["seven_day"]["resets_at"] == 1785336668
+    assert out["five_hour"]["resets_at"] == 1784821868
+    req, timeout = calls[0]
+    assert req.full_url == "https://api.kimi.com/coding/v1/usages"
+    assert req.headers["Authorization"] == "Bearer tok"
+    assert timeout == 2.5
 
-    def test_fresh_cache_skips_fetch(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        self._write_cache(cache, age_s=10)
 
-        def boom(base, tok):
-            raise AssertionError("fetch must not run inside the TTL")
+def test_fetch_omits_malformed_window_without_dropping_valid_one(monkeypatch):
+    payload = {
+        "usage": LIVE_PAYLOAD["usage"],
+        "limits": [{"window": {"duration": 300,
+                               "timeUnit": "TIME_UNIT_MINUTE"},
+                    "detail": {"limit": "100", "used": "NaN",
+                               "resetTime": "not-a-date"}}],
+    }
+    _mock_urlopen(monkeypatch, payload)
 
-        assert _kimi_usage("b", "t", cache_path=cache, fetcher=boom) == GOOD
+    out = _kimi().fetch_usage("https://api.kimi.com/coding", "tok")
 
-    def test_stale_cache_fetches_and_rewrites(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        self._write_cache(cache, age_s=3600, limits={"stale": True})
-        new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
-        out = _kimi_usage("b", "t", cache_path=cache, fetcher=lambda b, t: new)
-        assert out == new
-        written = json.loads(cache.read_text())
-        entry = written["entries"][core._kimi_cache_key("b", "t")]
-        assert entry["limits"] == new
-        assert entry["fetched_at"] > time.time() - 60
+    assert "five_hour" not in out
+    assert out["seven_day"]["pct"] == pytest.approx(12.0)
 
-    def test_fetch_error_serves_stale_cache(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        self._write_cache(cache, age_s=86400)  # any age — errors keep it
 
-        def fail(base, tok):
-            raise OSError("timeout")
+def test_fetch_preserves_over_limit_percentage(monkeypatch):
+    payload = {"usage": {**LIVE_PAYLOAD["usage"], "used": "120"},
+               "limits": []}
+    _mock_urlopen(monkeypatch, payload)
 
-        assert _kimi_usage("b", "t", cache_path=cache, fetcher=fail) == GOOD
+    out = _kimi().fetch_usage("https://api.kimi.com/coding", "tok")
 
-    def test_fetch_error_without_cache_returns_empty_and_throttles(self, tmp_path):
-        fetches = []
+    assert out["seven_day"]["pct"] == pytest.approx(120.0)
 
-        def fail(base, tok):
-            fetches.append(True)
-            raise OSError("timeout")
 
-        cache = tmp_path / "none.json"
-        assert _kimi_usage("b", "t", cache_path=cache, fetcher=fail) == {}
-        assert _kimi_usage("b", "t", cache_path=cache, fetcher=fail) == {}
-        assert fetches == [True]
+def test_insecure_kimi_url_never_sends_bearer_token(monkeypatch):
+    calls = _mock_urlopen(monkeypatch, LIVE_PAYLOAD)
 
-    def test_missing_token_never_fetches(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        self._write_cache(cache, age_s=86400, token="present")
+    with pytest.raises(ValueError, match="HTTPS"):
+        _kimi().fetch_usage("http://api.kimi.com/coding", "tok")
 
-        def boom(base, tok):
-            raise AssertionError("fetch must not run without a token")
+    assert calls == []
 
-        assert _kimi_usage("b", "", cache_path=cache, fetcher=boom) == {}
 
-    def test_failed_cache_write_still_throttles_refresh(self, monkeypatch, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
-        fetches = []
+def test_fetch_does_not_follow_redirects(monkeypatch):
+    handlers = []
 
-        def fetch(base, token):
-            fetches.append(True)
-            return new
+    class _Opener:
+        def open(self, req, timeout):
+            return _FakeResp(LIVE_PAYLOAD)
 
-        def fail_replace(src, dst):
-            raise OSError("read-only cache")
+    def build_opener(*installed):
+        handlers.extend(installed)
+        return _Opener()
 
-        monkeypatch.setattr(core.os, "replace", fail_replace)
+    kimi = _kimi()
+    monkeypatch.setattr(kimi.urllib.request, "build_opener", build_opener)
+    monkeypatch.setattr(kimi.urllib.request, "urlopen",
+                        lambda *a, **k: pytest.fail("urlopen must not be used"))
 
-        assert _kimi_usage("b", "t", cache_path=cache,
-                           fetcher=fetch) == new
-        assert _kimi_usage("b", "t", cache_path=cache,
-                           fetcher=fetch) == {}
-        assert fetches == [True]
+    kimi.fetch_usage("https://api.kimi.com/coding", "tok")
 
-    def test_refresh_throttle_is_scoped_to_url_and_token(
-            self, monkeypatch, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        fetches = []
+    assert len(handlers) == 1
+    assert isinstance(handlers[0], kimi._NoRedirectHandler)
+    assert handlers[0].redirect_request(
+        None, None, 302, "Found", {}, "https://example.invalid/collect") is None
 
-        def fetch(base, token):
-            fetches.append((base, token))
-            return {"five_hour": {"pct": 1.0, "resets_at": 2}}
+
+def test_cached_limits_are_account_scoped_and_secret_free(tmp_path, monkeypatch):
+    cache = _cache()
+    monkeypatch.setattr(cache, "_cache_root", lambda: tmp_path)
+    fp = cache.fingerprint("https://api.kimi.com/coding", "synthetic-token")
+    cache.write_cache_atomic(fp, {"ts": 100, "limits": VALID_LIMITS})
+
+    live = {"ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
+            "ANTHROPIC_AUTH_TOKEN": "synthetic-token"}
+    assert cache.cached_limits(live) == VALID_LIMITS
+    assert cache.cached_limits({**live, "ANTHROPIC_AUTH_TOKEN": "other"}) is None
+    assert cache.cached_limits({**live, "ANTHROPIC_BASE_URL":
+                                "https://other.kimi.com/coding"}) is None
+    assert cache.cached_limits({"CS_KIMI_FP": fp}) == VALID_LIMITS
+    assert "synthetic-token" not in cache.cache_path_for(fp).read_text()
+
+
+def test_stale_limits_remain_renderable_but_not_fresh(tmp_path, monkeypatch):
+    cache = _cache()
+    monkeypatch.setattr(cache, "_cache_root", lambda: tmp_path)
+    fp = "account"
+    cache.write_cache_atomic(fp, {"ts": 100, "limits": VALID_LIMITS})
+
+    entry = cache.read_cache(fp)
+    assert cache.cached_limits({"CS_KIMI_FP": fp}) == VALID_LIMITS
+    assert cache.is_fresh(entry, now=100 + cache.TTL_SECONDS - 1)
+    assert not cache.is_fresh(entry, now=100 + cache.TTL_SECONDS)
+
 
-        def fail_replace(src, dst):
-            raise OSError("read-only cache")
-
-        monkeypatch.setattr(core.os, "replace", fail_replace)
-
-        _kimi_usage("old", "same", cache_path=cache, fetcher=fetch)
-        _kimi_usage("new", "same", cache_path=cache, fetcher=fetch)
-
-        assert fetches == [("old", "same"), ("new", "same")]
-
-    def test_refresh_throttle_is_scoped_to_token(
-            self, monkeypatch, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        fetches = []
-
-        def fetch(base, token):
-            fetches.append((base, token))
-            return {"five_hour": {"pct": 1.0, "resets_at": 2}}
-
-        def fail_replace(src, dst):
-            raise OSError("read-only cache")
-
-        monkeypatch.setattr(core.os, "replace", fail_replace)
-
-        _kimi_usage("same", "old", cache_path=cache, fetcher=fetch)
-        _kimi_usage("same", "new", cache_path=cache, fetcher=fetch)
-
-        assert fetches == [("same", "old"), ("same", "new")]
-
-    def test_cache_keeps_alternating_identities(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        fetches = []
-
-        def fetch(base, token):
-            fetches.append((base, token))
-            return {"five_hour": {"pct": len(fetches), "resets_at": 2}}
-
-        first = _kimi_usage("same", "old", cache_path=cache, fetcher=fetch)
-        second = _kimi_usage("same", "new", cache_path=cache, fetcher=fetch)
-        first_again = _kimi_usage("same", "old", cache_path=cache,
-                                  fetcher=fetch)
-
-        assert first["five_hour"]["pct"] == 1
-        assert second["five_hour"]["pct"] == 2
-        assert first_again == first
-        assert fetches == [("same", "old"), ("same", "new")]
-
-    def test_usage_normalizes_base_url_before_fetching(self, tmp_path):
-        seen = []
-
-        def fetch(base, token):
-            seen.append(base)
-            return GOOD
-
-        _kimi_usage(" https://api.kimi.com/coding/ ", "token",
-                    cache_path=tmp_path / "kimi_usage.json", fetcher=fetch)
-
-        assert seen == ["https://api.kimi.com/coding/"]
-
-    def test_cache_evicts_oldest_identity_when_bounded(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-
-        def fetch(base, token):
-            return {"five_hour": {"pct": int(token), "resets_at": 2}}
-
-        for token in range(core.KIMI_USAGE_MAX_CACHE_ENTRIES + 1):
-            assert _kimi_usage("base", str(token), cache_path=cache,
-                               fetcher=fetch)
-
-        entries = json.loads(cache.read_text())["entries"]
-        assert len(entries) == core.KIMI_USAGE_MAX_CACHE_ENTRIES
-        assert core._kimi_cache_key("base", "0") not in entries
-        assert core._kimi_cache_key(
-            "base", str(core.KIMI_USAGE_MAX_CACHE_ENTRIES)) in entries
-
-    def test_expired_refresh_markers_are_cleaned_during_refresh(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        expired = core._kimi_refresh_marker_path(
-            cache, core._kimi_cache_key("old", "token"))
-        expired.parent.mkdir(parents=True, exist_ok=True)
-        expired.touch()
-        old_time = time.time() - core.KIMI_USAGE_TTL_S - 1
-        os.utime(expired, (old_time, old_time))
-
-        _kimi_usage("current", "token", cache_path=cache,
-                    fetcher=lambda base, token: GOOD)
-
-        assert not expired.exists()
-
-    def test_cache_files_are_owner_only_on_posix(self, tmp_path):
-        if os.name == "nt":
-            return
-
-        cache = tmp_path / "kimi_usage.json"
-        _kimi_usage("b", "t", cache_path=cache,
-                    fetcher=lambda b, t: {"five_hour": {
-                        "pct": 1.0, "resets_at": 2}})
-
-        assert cache.stat().st_mode & 0o777 == 0o600
-        assert cache.with_name("kimi_usage.json.lock").stat().st_mode & 0o777 == 0o600
-        assert cache.parent.stat().st_mode & 0o777 == 0o700
-
-    def test_corrupt_cache_is_treated_as_absent(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        cache.write_text("not json{{")
-
-        def fail(base, tok):
-            raise OSError("down")
-
-        assert _kimi_usage("b", "t", cache_path=cache, fetcher=fail) == {}
-
-    def test_non_string_legacy_cache_key_is_treated_as_absent(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        cache.write_text(json.dumps({"cache_key": ["bad"],
-                                     "fetched_at": time.time(),
-                                     "limits": GOOD}))
-        new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
-
-        assert _kimi_usage("b", "t", cache_path=cache,
-                           fetcher=lambda base, token: new) == new
-
-        written = json.loads(cache.read_text())
-        assert core._kimi_cache_key("b", "t") in written["entries"]
-
-    def test_non_numeric_fetched_at_treated_as_stale(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        cache.write_text(json.dumps({
-            "cache_key": core._kimi_cache_key("b", "t"),
-            "fetched_at": "junk", "limits": GOOD}))
-        new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
-        out = _kimi_usage("b", "t", cache_path=cache, fetcher=lambda b, t: new)
-        assert out == new
-
-    def test_impossible_fetched_at_is_treated_as_stale(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        cache.write_text(json.dumps({
-            "cache_key": core._kimi_cache_key("b", "t"),
-            "fetched_at": 10 ** 1000, "limits": GOOD}))
-        new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
-        out = _kimi_usage("b", "t", cache_path=cache, fetcher=lambda b, t: new)
-        assert out == new
-
-    def test_non_dict_limits_treated_as_absent(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        cache.write_text(json.dumps({
-            "cache_key": core._kimi_cache_key("b", "t"),
-            "fetched_at": time.time(), "limits": [1, 2]}))
-
-        def fail(base, tok):
-            raise OSError("down")
-
-        assert _kimi_usage("b", "t", cache_path=cache, fetcher=fail) == {}
-
-    def test_future_fetched_at_is_treated_as_stale(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        self._write_cache(cache, age_s=-3600)
-        new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
-        assert _kimi_usage("b", "t", cache_path=cache,
-                           fetcher=lambda b, t: new) == new
-
-    def test_future_refresh_lease_is_reclaimable(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        lock = cache.with_name(f"{cache.name}.lock")
-        lock.write_text("old-lease")
-        future = time.time() + 3600
-        os.utime(lock, (future, future))
-
-        lease = core._claim_file_lease(cache, 10)
-
-        assert lease is not None
-        core._release_file_lease(lease)
-
-    def test_cache_is_scoped_to_token(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        self._write_cache(cache, age_s=10, token="old")
-        new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
-        assert _kimi_usage("b", "new", cache_path=cache,
-                           fetcher=lambda b, t: new) == new
-
-    def test_cache_is_scoped_to_url_with_same_token(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        self._write_cache(cache, age_s=10, base="old", token="same")
-        new = {"five_hour": {"pct": 1.0, "resets_at": 2}}
-        assert _kimi_usage("new", "same", cache_path=cache,
-                           fetcher=lambda b, t: new) == new
-
-    def test_incomplete_fresh_cache_omits_only_invalid_window(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        self._write_cache(cache, age_s=10, limits={
-            "five_hour": {"pct": 16.0},
-            "seven_day": GOOD["seven_day"],
-        })
-
-        def boom(base, tok):
-            raise AssertionError("valid cached window must not fetch")
-
-        assert _kimi_usage("b", "t", cache_path=cache, fetcher=boom) == {
-            "seven_day": GOOD["seven_day"],
-        }
-
-    def test_impossible_reset_epoch_is_omitted_from_fresh_cache(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        self._write_cache(cache, age_s=10, token="", limits={
-            "five_hour": {"pct": 16.0, "resets_at": 10 ** 1000},
-            "seven_day": GOOD["seven_day"],
-        })
-
-        assert _kimi_usage("b", "", cache_path=cache) == {
-            "seven_day": GOOD["seven_day"],
-        }
-
-    def test_concurrent_stale_cache_refresh_uses_one_fetch(self, tmp_path):
-        cache = tmp_path / "kimi_usage.json"
-        self._write_cache(cache, age_s=3600)
-        fetch_started = Event()
-        allow_first_fetch_to_finish = Event()
-        first_result = []
-        second_fetches = []
-
-        def first_fetch(base, token):
-            fetch_started.set()
-            assert allow_first_fetch_to_finish.wait(timeout=1)
-            return {"five_hour": {"pct": 1.0, "resets_at": 2}}
-
-        def second_fetch(base, token):
-            second_fetches.append(True)
-            return {"five_hour": {"pct": 2.0, "resets_at": 3}}
-
-        thread = Thread(target=lambda: first_result.append(
-            _kimi_usage("b", "t", cache_path=cache, fetcher=first_fetch)))
-        thread.start()
-        assert fetch_started.wait(timeout=1)
-        assert _kimi_usage("b", "t", cache_path=cache,
-                           fetcher=second_fetch) == GOOD
-        allow_first_fetch_to_finish.set()
-        thread.join(timeout=1)
-
-        assert not thread.is_alive()
-        assert first_result == [{"five_hour": {"pct": 1.0, "resets_at": 2}}]
-        assert second_fetches == []
-
-
-def _run_parse(monkeypatch, tmp_path, payload, env):
-    """parse_stdin_data against a synthetic stdin payload + env. HOME redirects
-    the in-function last_stdin.json cache into tmp_path; CTX_STATE_FILE (a
-    module-level constant) is patched explicitly so _smooth_context can't
-    clobber the real session's state file."""
+def test_failed_refresh_backoff_uses_attempt_time(tmp_path, monkeypatch):
+    cache = _cache()
+    monkeypatch.setattr(cache, "_cache_root", lambda: tmp_path)
+    cache.write_cache_atomic("account", {
+        "ts": 100, "attempted_at": 500, "refresh_failed": True,
+        "limits": VALID_LIMITS,
+    })
+
+    entry = cache.read_cache("account")
+    assert cache.is_fresh(entry, now=529)
+    assert not cache.is_fresh(entry, now=530)
+    assert cache.cached_limits({"CS_KIMI_FP": "account"}) == VALID_LIMITS
+
+
+def test_invalid_cached_window_is_dropped(tmp_path, monkeypatch):
+    cache = _cache()
+    monkeypatch.setattr(cache, "_cache_root", lambda: tmp_path)
+    cache.cache_path_for("partial").write_text(json.dumps({
+        "ts": 100,
+        "limits": {"five_hour": {"pct": "16", "resets_at": 1784821868},
+                   "seven_day": VALID_LIMITS["seven_day"]},
+    }))
+    cache.cache_path_for("invalid").write_text(json.dumps({
+        "ts": 100, "limits": {"five_hour": {"pct": True, "resets_at": -1}},
+    }))
+
+    assert cache.cached_limits({"CS_KIMI_FP": "partial"}) == {
+        "seven_day": VALID_LIMITS["seven_day"]}
+    assert cache.cached_limits({"CS_KIMI_FP": "invalid"}) is None
+
+
+def test_detached_refresh_writes_only_quota_data(tmp_path, monkeypatch):
+    cache = _cache()
+    monkeypatch.setattr(cache, "_cache_root", lambda: tmp_path)
+    monkeypatch.setattr(_kimi(), "fetch_usage", lambda base, token: VALID_LIMITS)
+    fp = cache.fingerprint("https://api.kimi.com/coding", "synthetic-token")
+
+    assert _refresh().refresh("https://api.kimi.com/coding",
+                              "synthetic-token", fp) == 0
+
+    entry = cache.read_cache(fp)
+    assert entry["limits"] == VALID_LIMITS
+    assert entry["ts"] > 0
+    assert "synthetic-token" not in cache.cache_path_for(fp).read_text()
+
+
+def test_failed_refresh_preserves_stale_limits(tmp_path, monkeypatch):
+    cache = _cache()
+    monkeypatch.setattr(cache, "_cache_root", lambda: tmp_path)
+    cache.write_cache_atomic("account", {"ts": 100, "limits": VALID_LIMITS})
+    def fail(base, token):
+        raise OSError("offline")
+    monkeypatch.setattr(_kimi(), "fetch_usage", fail)
+    monkeypatch.setattr(_refresh().time, "time", lambda: 500)
+
+    assert _refresh().refresh("https://api.kimi.com/coding", "token", "account") == 0
+
+    entry = cache.read_cache("account")
+    assert entry["limits"] == VALID_LIMITS
+    assert entry["ts"] == 100
+    assert entry["attempted_at"] == 500
+    assert entry["refresh_failed"] is True
+
+
+def test_refresh_lock_prevents_duplicate_network_fetch(tmp_path, monkeypatch):
+    from claude_statusbar import git_cache
+    cache = _cache()
+    monkeypatch.setattr(cache, "_cache_root", lambda: tmp_path)
+    monkeypatch.setattr(git_cache, "cache_path_for",
+                        lambda name: tmp_path / f"{name}.json")
+    monkeypatch.setattr(_kimi(), "fetch_usage",
+                        lambda *args: pytest.fail("duplicate fetch"))
+    lock = git_cache.try_claim("kimi:account")
+    try:
+        assert _refresh().refresh("https://api.kimi.com/coding", "token", "account") == 0
+    finally:
+        lock.close()
+
+
+def test_initial_failed_refresh_has_retry_backoff(tmp_path, monkeypatch):
+    cache = _cache()
+    monkeypatch.setattr(cache, "_cache_root", lambda: tmp_path)
+    monkeypatch.setattr(_kimi(), "fetch_usage",
+                        lambda *args: (_ for _ in ()).throw(OSError("offline")))
+    monkeypatch.setattr(_refresh().time, "time", lambda: 500)
+
+    assert _refresh().refresh("https://api.kimi.com/coding", "token", "account") == 0
+
+    entry = cache.read_cache("account")
+    assert cache.cached_limits({"CS_KIMI_FP": "account"}) is None
+    assert cache.is_fresh(entry, now=529)
+    assert not cache.is_fresh(entry, now=530)
+
+
+def test_failed_cache_write_keeps_refresh_inflight(tmp_path, monkeypatch):
+    from claude_statusbar import git_cache
+    cache = _cache()
+    monkeypatch.setattr(cache, "_cache_root", lambda: tmp_path)
+    monkeypatch.setattr(git_cache, "cache_path_for",
+                        lambda name: tmp_path / f"{name}.json")
+    monkeypatch.setattr(_kimi(), "fetch_usage", lambda base, token: VALID_LIMITS)
+    monkeypatch.setattr(cache, "write_cache_atomic", lambda fp, entry: False)
+    cache.mark_inflight("account")
+
+    assert _refresh().refresh("https://api.kimi.com/coding", "token", "account") == 0
+
+    assert cache.is_inflight("account")
+
+
+def test_inflight_marker_lifecycle(tmp_path, monkeypatch):
+    cache = _cache()
+    monkeypatch.setattr(cache, "_cache_root", lambda: tmp_path)
+
+    assert not cache.is_inflight("account")
+    cache.mark_inflight("account")
+    assert cache.is_inflight("account")
+    cache.clear_inflight("account")
+    assert not cache.is_inflight("account")
+
+
+def test_stale_limits_render_immediately_and_spawn_only_detached_refresh(
+        tmp_path, monkeypatch):
+    cache = _cache()
+    core = _core()
+    monkeypatch.setattr(cache, "_cache_root", lambda: tmp_path)
+    base = "https://api.kimi.com/coding"
+    fp = cache.fingerprint(base, "synthetic-token")
+    cache.write_cache_atomic(fp, {"ts": 100, "limits": VALID_LIMITS})
+    calls = []
+    monkeypatch.setattr(subprocess, "Popen",
+                        lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(_kimi(), "fetch_usage",
+                        lambda *args: pytest.fail("synchronous network fetch"))
+
+    env = {"ANTHROPIC_BASE_URL": base, "ANTHROPIC_AUTH_TOKEN": "synthetic-token"}
+    assert core.kimi_limits(env) == VALID_LIMITS
+    assert core.kimi_limits(env) == VALID_LIMITS  # inflight suppresses a duplicate
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    argv = args[0]
+    assert argv[1:3] == ["-m", "claude_statusbar._kimi_refresh"]
+    assert argv[3] == base
+    assert "synthetic-token" not in argv
+    assert kwargs["env"]["CS_KIMI_TOKEN"] == "synthetic-token"
+    assert kwargs["env"]["CS_KIMI_FP"] == fp
+    assert kwargs["start_new_session"] is True
+    assert kwargs["stdout"] is subprocess.DEVNULL
+
+
+def test_kimi_refresh_respects_fresh_read_only_and_daemon_modes(
+        tmp_path, monkeypatch):
+    cache = _cache()
+    core = _core()
+    monkeypatch.setattr(cache, "_cache_root", lambda: tmp_path)
+    base = "https://api.kimi.com/coding"
+    fp = cache.fingerprint(base, "token")
+    calls = []
+    monkeypatch.setattr(subprocess, "Popen",
+                        lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    cache.write_cache_atomic(fp, {"ts": 100, "limits": VALID_LIMITS})
+    assert core.kimi_limits({"CS_KIMI_FP": fp,
+                             "ANTHROPIC_BASE_URL": base}) == VALID_LIMITS
+    assert core.kimi_limits({"ANTHROPIC_BASE_URL": base,
+                             "ANTHROPIC_AUTH_TOKEN": "token"}, spawn=False) == VALID_LIMITS
+    assert calls == []
+
+    import time
+    cache.write_cache_atomic(fp, {"ts": time.time(), "limits": VALID_LIMITS})
+    assert core.kimi_limits({"ANTHROPIC_BASE_URL": base,
+                             "ANTHROPIC_AUTH_TOKEN": "token"}) == VALID_LIMITS
+    assert calls == []
+
+
+def test_persistent_worker_uses_background_pool(tmp_path, monkeypatch):
+    from claude_statusbar import identity, refresh_pool
+    cache = _cache()
+    core = _core()
+    monkeypatch.setattr(cache, "_cache_root", lambda: tmp_path)
+    monkeypatch.setattr(identity, "_BACKGROUND_COLLECTORS", True)
+    calls = []
+    monkeypatch.setattr(refresh_pool, "submit",
+                        lambda *args: calls.append(args))
+    monkeypatch.setattr(subprocess, "Popen",
+                        lambda *args, **kwargs: pytest.fail("unexpected child"))
+    env = {"ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
+           "ANTHROPIC_API_KEY": "token"}
+
+    assert core.kimi_limits(env) is None
+    assert len(calls) == 1
+    key, func, base, token, fp = calls[0]
+    assert key == ("kimi", fp)
+    assert base == env["ANTHROPIC_BASE_URL"]
+    assert token == "token"
+    assert func.__name__ == "refresh"
+
+
+def test_kimi_refresh_rejects_non_kimi_and_insecure_urls(monkeypatch):
+    core = _core()
+    calls = []
+    monkeypatch.setattr(subprocess, "Popen",
+                        lambda *args, **kwargs: calls.append((args, kwargs)))
+    for base in ("https://relay.example", "http://api.kimi.com/coding",
+                 "https://api.kimi.com.evil.example"):
+        assert core.kimi_limits({"ANTHROPIC_BASE_URL": base,
+                                 "ANTHROPIC_AUTH_TOKEN": "token"}) is None
+    assert calls == []
+
+
+def test_kimi_is_quota_capable_unless_explicitly_overridden():
+    core = _core()
+    env = {"ANTHROPIC_BASE_URL": "https://api.kimi.com/coding"}
+    assert not core.is_no_quota_mode(env)
+    assert core.is_no_quota_mode(env, override="on")
+    assert not core.is_no_quota_mode(env, override="off")
+    assert core.is_no_quota_mode({"ANTHROPIC_BASE_URL": "https://relay.example"})
+
+
+def test_parse_uses_kimi_cache_not_anthropic_payload_or_cache(
+        tmp_path, monkeypatch):
+    from claude_statusbar import quota_cache
+    cache = _cache()
+    core = _core()
+    monkeypatch.setattr(cache, "_cache_root", lambda: tmp_path)
+    base = "https://api.kimi.com/coding"
+    fp = cache.fingerprint(base, "token")
+    cache.write_cache_atomic(fp, {"ts": 100, "limits": VALID_LIMITS})
+    monkeypatch.setattr(quota_cache, "remember",
+                        lambda *args: pytest.fail("must not seed Anthropic quota"))
+    monkeypatch.setattr(quota_cache, "read",
+                        lambda *args: pytest.fail("must not read Anthropic quota"))
+    payload = {
+        "_cs_env": {"ANTHROPIC_BASE_URL": base, "CS_KIMI_FP": fp},
+        "rate_limits": {"five_hour": {"used_percentage": 99, "resets_at": 1}},
+    }
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    result = core.parse_stdin_data()
+
+    assert result["_kimi_quota"] is True
+    assert result["rate_limit_pct"] == 16.0
+    assert result["rate_limit_resets_at"] == 1784821868
+    assert result["rate_limit_7d_pct"] == 12.0
+    assert result["rate_limit_7d_resets_at"] == 1785336668
+
+
+def _write_main_config(tmp_path, monkeypatch, **values):
+    from claude_statusbar import config
+    path = tmp_path / ".claude" / "claude-statusbar.json"
+    path.parent.mkdir(exist_ok=True)
+    payload = {"style": "classic", "show_project_branch": False,
+               "show_cache_age": False, "show_todos": False,
+               "show_projection": False, "show_forecast": False,
+               "show_fp_risk": False, "show_per_model": False}
+    payload.update(values)
+    path.write_text(json.dumps(payload))
+    monkeypatch.setattr(config, "CONFIG_PATH", path)
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(core, "CTX_STATE_FILE", tmp_path / "ctx_state.json")
-    for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"):
-        monkeypatch.delenv(key, raising=False)
-    for key, val in env.items():
-        monkeypatch.setenv(key, val)
-    return parse_stdin_data()
 
 
-STDIN_RL = {"rate_limits": {
-    "five_hour": {"used_percentage": 42.0, "resets_at": 1784821868},
-    "seven_day": {"used_percentage": 7.0, "resets_at": 1785336668}}}
+def test_main_renders_kimi_without_anthropic_prediction(
+        tmp_path, monkeypatch, capsys):
+    from claude_statusbar import predict
+    cache = _cache()
+    core = _core()
+    monkeypatch.setattr(cache, "_cache_root", lambda: tmp_path / "kimi")
+    _write_main_config(tmp_path, monkeypatch,
+                       show_projection=True, show_forecast=True,
+                       show_per_model=True)
+    from claude_statusbar import scoped_usage
+    monkeypatch.setattr(scoped_usage, "cached_limits",
+                        lambda *a, **k: pytest.fail("Anthropic scoped quota used"))
+    base = "https://api.kimi.com/coding"
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", base)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token")
+    monkeypatch.delenv("CS_API_MODE", raising=False)
+    fp = cache.fingerprint(base, "token")
+    cache.write_cache_atomic(fp, {"ts": 100, "limits": VALID_LIMITS})
+    for name in ("reconcile_account", "projection", "forecast"):
+        monkeypatch.setattr(predict, name,
+                            lambda *a, **k: pytest.fail("Anthropic prediction used"))
+    scheduled = []
+    monkeypatch.setattr(core, "kimi_limits",
+                        lambda env: scheduled.append(env) or cache.cached_limits(env))
+    payload = {"session_id": "kimi", "model": {"id": "k3", "display_name": "Kimi K3"}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    core.main(use_color=False, _suppress_side_effects=True)
+
+    out = capsys.readouterr().out
+    assert "Kimi K3" in out
+    assert "5h " in out and "16%" in out
+    assert "7d " in out and "12%" in out
+    assert "ctx " not in out
+    assert len(scheduled) == 1
 
 
-class TestParseStdinData:
-    def test_default_backend_reads_stdin_rate_limits(self, monkeypatch, tmp_path):
-        out = _run_parse(monkeypatch, tmp_path, STDIN_RL, env={})
-        assert out["rate_limit_pct"] == 42.0
-        assert out["rate_limit_7d_pct"] == 7.0
+def test_main_kimi_without_cache_waits_without_stale_warning(
+        tmp_path, monkeypatch, capsys):
+    from claude_statusbar import predict
+    cache = _cache()
+    core = _core()
+    monkeypatch.setattr(cache, "_cache_root", lambda: tmp_path / "kimi")
+    _write_main_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.kimi.com/coding")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token")
+    monkeypatch.delenv("CS_API_MODE", raising=False)
+    monkeypatch.setattr(core, "kimi_limits", lambda env: None)
+    monkeypatch.setattr(core, "_transcript_has_assistant", lambda path: True)
+    monkeypatch.setattr(core, "_no_quota_heuristic",
+                        lambda *a, **k: pytest.fail("Kimi used relay heuristic"))
+    monkeypatch.setattr(predict, "quota_cache_status",
+                        lambda: pytest.fail("Anthropic stale state used"))
+    payload = {"session_id": "kimi", "version": "2.1.90",
+               "transcript_path": "/session.jsonl",
+               "model": {"id": "k3", "display_name": "Kimi K3"}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
 
-    def test_kimi_backend_uses_kimi_usage(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(core, "_kimi_usage", lambda b, t: GOOD)
-        out = _run_parse(monkeypatch, tmp_path, {"model": {}}, env={
-            "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
-            "ANTHROPIC_AUTH_TOKEN": "tok"})
-        assert out["rate_limit_pct"] == 16.0
-        assert out["rate_limit_resets_at"] == 1784821868
-        assert out["rate_limit_7d_pct"] == 12.0
-        assert out["rate_limit_7d_resets_at"] == 1785336668
+    core.main(use_color=False, _suppress_side_effects=True)
 
-    def test_kimi_backend_skips_stale_anthropic_fallback(self, monkeypatch, tmp_path):
-        # A previous default-backend session left Anthropic numbers in the cache…
-        cache = tmp_path / ".cache" / "claude-statusbar"
-        cache.mkdir(parents=True)
-        (cache / "last_stdin.json").write_text(json.dumps(STDIN_RL))
-        # …and Kimi has no quota data yet: the bar must show NOTHING, not the
-        # stale Anthropic numbers (today's bug).
-        monkeypatch.setattr(core, "_kimi_usage", lambda b, t: {})
-        out = _run_parse(monkeypatch, tmp_path, {"model": {}}, env={
-            "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
-            "ANTHROPIC_AUTH_TOKEN": "tok"})
-        assert "rate_limit_pct" not in out
-        assert "rate_limit_7d_pct" not in out
+    out = capsys.readouterr().out
+    assert "Kimi K3" in out
+    assert "stale" not in out
+    assert "ctx[" not in out
 
-    def test_default_backend_keeps_cache_fallback(self, monkeypatch, tmp_path):
-        cache = tmp_path / ".cache" / "claude-statusbar"
-        cache.mkdir(parents=True)
-        (cache / "last_stdin.json").write_text(json.dumps(STDIN_RL))
-        out = _run_parse(monkeypatch, tmp_path, {"model": {}}, env={})
-        assert out["rate_limit_pct"] == 42.0
 
-    def test_kimi_rate_limits_do_not_seed_default_cache(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(core, "_kimi_usage", lambda b, t: GOOD)
-        _run_parse(monkeypatch, tmp_path, STDIN_RL, env={
-            "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
-            "ANTHROPIC_AUTH_TOKEN": "tok"})
+def test_explicit_no_quota_override_disables_kimi_refresh(
+        tmp_path, monkeypatch, capsys):
+    cache = _cache()
+    core = _core()
+    monkeypatch.setattr(cache, "_cache_root", lambda: tmp_path / "kimi")
+    _write_main_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.kimi.com/coding")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token")
+    monkeypatch.setenv("CS_API_MODE", "on")
+    monkeypatch.setattr(core, "kimi_limits",
+                        lambda env: pytest.fail("quota refresh in no-quota mode"))
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
+        "model": {"id": "k3", "display_name": "Kimi K3"},
+        "context_window": {"context_window_size": 1000000,
+                           "used_percentage": 35,
+                           "total_input_tokens": 350000},
+    })))
 
-        out = _run_parse(monkeypatch, tmp_path, {"model": {}}, env={})
-        assert "rate_limit_pct" not in out
-        assert "rate_limit_7d_pct" not in out
+    core.main(use_color=False, _suppress_side_effects=True)
+
+    out = capsys.readouterr().out
+    assert "ctx" in out
+    assert "350.0k/1.0M" in out
+    assert "5h" not in out
+
+
+def test_thin_client_stamps_secret_free_kimi_fingerprint(monkeypatch):
+    from claude_statusbar import render_thin
+    core = _core()
+    cache = _cache()
+    base = "https://api.kimi.com/coding"
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", base)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic-primary")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "synthetic-fallback")
+    calls = []
+    monkeypatch.setattr(core, "kimi_limits",
+                        lambda env: calls.append(env))
+    monkeypatch.setattr(core, "relay_balance",
+                        lambda env: pytest.fail("Kimi must not probe relay balance"))
+
+    stamped = render_thin._inject_session_env(b'{"session_id":"kimi"}')
+
+    session_env = json.loads(stamped)["_cs_env"]
+    assert session_env["CS_KIMI_FP"] == cache.fingerprint(base, "synthetic-primary")
+    assert b"synthetic-primary" not in stamped
+    assert b"synthetic-fallback" not in stamped
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("source", ["env", "config"])
+def test_thin_client_no_quota_never_refreshes_kimi(
+        tmp_path, monkeypatch, source):
+    from claude_statusbar import render_thin
+    core = _core()
+    cache = _cache()
+    base = "https://api.kimi.com/coding"
+    _write_main_config(tmp_path, monkeypatch,
+                       api_mode="on" if source == "config" else "auto")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", base)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
+    if source == "env":
+        monkeypatch.setenv("CS_API_MODE", "on")
+    else:
+        monkeypatch.delenv("CS_API_MODE", raising=False)
+    monkeypatch.setattr(core, "kimi_limits",
+                        lambda env: pytest.fail("quota refresh in no-quota mode"))
+
+    stamped = render_thin._inject_session_env(b'{"session_id":"kimi"}')
+
+    session_env = json.loads(stamped)["_cs_env"]
+    assert session_env["CS_KIMI_FP"] == cache.fingerprint(base, "synthetic")
+    assert b"synthetic" not in stamped

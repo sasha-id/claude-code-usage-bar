@@ -1,0 +1,504 @@
+"""User-facing config persisted at ~/.claude/claude-statusbar.json.
+
+Resolution order for any field:
+    1. CLI flag        (e.g. --style classic)
+    2. Env var         (e.g. CLAUDE_STATUSBAR_STYLE)
+    3. Config file     (~/.claude/claude-statusbar.json)
+    4. Built-in default
+"""
+
+import json
+import os
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any, Optional
+
+CONFIG_PATH = Path.home() / ".claude" / "claude-statusbar.json"
+
+DEFAULT_STYLE = "aurora"
+DEFAULT_THEME = "graphite"
+DEFAULT_DENSITY = "regular"   # cozy | regular | compact
+DEFAULT_BAR_GLYPH = "block"   # block (■) | thin (━) — aurora bar cells
+# Bump whenever a release adds or changes the looks `cs theme` offers. Anyone
+# whose `looks_seen` is lower gets the picker after an interactive `cs upgrade`
+# and a one-line hint on the bar until they open it.
+LOOKS_VERSION = 1   # 3.50: aurora ■ / aurora ━ / classic
+DEFAULT_AUTO_COMPACT_WIDTH = 0  # deprecated no-op: the hairline style it switched to is gone
+DEFAULT_CACHE_TTL_SECONDS = 300  # 5min — Anthropic's base prompt cache TTL.
+DEFAULT_CWD_STYLE = "basename"  # basename | full — how show_cwd renders the dir
+DEFAULT_NARROW_LAYOUT = "drop"  # drop | stack — what line 1 does when wider than the pane
+DEFAULT_API_MODE = "auto"  # auto-detect relay/Bedrock/Vertex | on (force) | off (force official)
+# DEPRECATED: the cache countdown now auto-detects the real TTL (5m vs 1h)
+# from the transcript's message.usage.cache_creation buckets, which reflect
+# subscription/API-key auth, ENABLE_PROMPT_CACHING_1H, FORCE_PROMPT_CACHING_5M
+# and the over-quota downgrade — see core.get_cache_age_text. The
+# cache_ttl_seconds field below is kept only so existing configs and
+# `cs config set cache_ttl_seconds …` don't error; it no longer affects render.
+
+
+@dataclass
+class StatusbarConfig:
+    style: str = DEFAULT_STYLE
+    theme: str = DEFAULT_THEME
+    density: str = DEFAULT_DENSITY
+    # Aurora bar cell shape: `block` (■, the default — `━` read as too thin
+    # for some) or `thin` (━, the original thin line). Colors are the same.
+    bar_glyph: str = DEFAULT_BAR_GLYPH
+    # Last LOOKS_VERSION the user has seen in `cs theme`; written by the picker.
+    looks_seen: int = 0
+    auto_compact_width: int = DEFAULT_AUTO_COMPACT_WIDTH  # deprecated, ignored
+    show_weekly: bool = True
+    show_per_model: bool = False
+    show_language: bool = True
+    show_cost: bool = False
+    # Relay account balance (no-quota mode only). Auto: shown when the relay
+    # exposes an OpenAI-compatible billing endpoint, silently hidden otherwise.
+    show_balance: bool = True
+    # Render the balance as a fuel-gauge battery (fill = remaining %) instead of
+    # plain `bal $X`. Falls back to text when the relay reports no usable limit.
+    balance_bar: bool = True
+    show_cache_age: bool = True
+    show_project_branch: bool = True
+    # open-cross-session address (`ocs boss · claude-7d5a5d07`) so other agents
+    # can `ocs dm` this session. Auto-hides unless ocs >= 0.5.0 is installed;
+    # only ever runs `ocs whoami --json`, in the background.
+    show_ocs: bool = True
+    # Working-directory segment (#30): workspace.current_dir from statusLine
+    # stdin (falls back to cwd), rendered on the identity line — or its own
+    # minimal line when show_project_branch is off. Opt-in: the bar is
+    # deliberately conservative about adding text (see #3).
+    show_cwd: bool = False
+    cwd_style: str = DEFAULT_CWD_STYLE  # basename (default) | full
+    # Line 1 wider than the pane: `drop` sheds optional segments (forecast,
+    # projection, ...) until it fits; `stack` first moves each quota bar onto
+    # its own line so nothing is lost (#73).
+    narrow_layout: str = DEFAULT_NARROW_LAYOUT
+    # Live-activity / session-stats segments. show_todos (activity line) and
+    # show_lines (+added -removed on the identity line) default on; the rest are
+    # opt-in so the line isn't crowded for users who didn't ask.
+    show_todos: bool = True
+    show_tools: bool = False
+    show_tool_rollup: bool = False
+    show_agents: bool = False
+    # Egress-IP risk chip on the identity line (proxycheck.io, 30-min cadence,
+    # detached prober — see ip_risk.py). Opt-in: it talks to a third party.
+    show_ip_risk: bool = False
+    # Local-only custom-endpoint notice, not a watermark/account detector.
+    # Default on; no request inspection, network calls or timezone inference.
+    show_fp_risk: bool = True
+    show_duration: bool = False
+    show_lines: bool = True
+    show_ahead_behind: bool = False
+    # A faint `· vX.Y.Z` at the very end of the identity line (dimmest grey).
+    show_version: bool = True
+    # A dedicated `⚙ effort:… · think:… · fast:… · style:…` session-mode line.
+    show_mode: bool = False
+    # When effort is top-tier (xhigh/max/ultracode), flow a pink→purple gradient
+    # across the whole mode line (steps ~1 char/s — statusLine can't animate
+    # smoothly). Default on.
+    mode_gradient: bool = True
+    # Experimental: a lightened cell sweeping the battery bar's filled portion,
+    # advancing one cell per render. Capped at the statusLine's ~1Hz refresh,
+    # so it's a slow step, not smooth. Default off; classic style only.
+    bar_shimmer: bool = False
+    # When on, shows the at-risk `⚠<eta>` warning chip when projected to hit the
+    # cap before reset.
+    show_forecast: bool = True
+    # When on, shows each window's projected end-of-window usage (`→NN%`) after
+    # its reset timer. Separate from the warning chip above.
+    show_projection: bool = True
+    cache_ttl_seconds: int = DEFAULT_CACHE_TTL_SECONDS  # deprecated; auto-detected now
+    # No-quota mode: drop the 5h/7d quota bars and promote context when official
+    # quota is unavailable (third-party relay via ANTHROPIC_BASE_URL, Bedrock,
+    # Vertex). "auto" detects from the environment; "on"/"off" force it.
+    api_mode: str = DEFAULT_API_MODE
+    warning_threshold: Optional[float] = None
+    critical_threshold: Optional[float] = None
+    # Per-severity color overrides — hex like "#4ec85b". None means "use the
+    # active theme's value". Layer on top of the resolved Theme, never mutate
+    # the theme itself. Set via `cs config set color_ok "#4ec85b"`; clear by
+    # setting to empty string.
+    color_ok: Optional[str] = None
+    color_warn: Optional[str] = None
+    color_hot: Optional[str] = None
+    # Worktree marker color on the identity line (theme.wt by default).
+    color_worktree: Optional[str] = None
+    # Glyph inside the worktree count: `worktree (🌳3)` / `fix-login (🌳3)`.
+    # An emoji keeps its own colors (the theme hue tints the text around it).
+    # Any 1-2 cell symbol works.
+    worktree_glyph: str = "🌳"
+    # Keep cs current on its own (checked every 6h) in a detached background process.
+    # CLAUDE_STATUSBAR_NO_UPDATE=1 still wins over this.
+    auto_upgrade: bool = True
+    # Language of sentence-like status text (risk lines): auto follows the OS.
+    lang: str = "auto"
+
+
+def _to_bool(v):
+    if isinstance(v, bool): return v
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "on", "y", "t")
+
+
+def load_config(path: Optional[Path] = None) -> StatusbarConfig:
+    path = CONFIG_PATH if path is None else path
+    if not path.exists():
+        return StatusbarConfig()
+    try:
+        from .file_snapshot import read_json
+        raw = read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return StatusbarConfig()
+    if not isinstance(raw, dict):
+        return StatusbarConfig()
+    if path == CONFIG_PATH:
+        raw = _migrate_ui(raw, path)
+    return StatusbarConfig(
+        style=str(raw.get("style", DEFAULT_STYLE)),
+        theme=str(raw.get("theme", DEFAULT_THEME)),
+        density=str(raw.get("density", DEFAULT_DENSITY)),
+        bar_glyph=str(raw.get("bar_glyph", DEFAULT_BAR_GLYPH)),
+        looks_seen=int(raw.get("looks_seen", 0) or 0),
+        auto_compact_width=int(raw.get("auto_compact_width", DEFAULT_AUTO_COMPACT_WIDTH) or 0),
+        show_weekly=_to_bool(raw.get("show_weekly", True)),
+        show_per_model=_to_bool(raw.get("show_per_model", False)),
+        show_language=_to_bool(raw.get("show_language", True)),
+        show_cost=_to_bool(raw.get("show_cost", False)),
+        show_balance=_to_bool(raw.get("show_balance", True)),
+        balance_bar=_to_bool(raw.get("balance_bar", True)),
+        show_cache_age=_to_bool(raw.get("show_cache_age", True)),
+        show_project_branch=_to_bool(raw.get("show_project_branch", True)),
+        show_ocs=_to_bool(raw.get("show_ocs", True)),
+        show_cwd=_to_bool(raw.get("show_cwd", False)),
+        cwd_style=str(raw.get("cwd_style", DEFAULT_CWD_STYLE)),
+        narrow_layout=str(raw.get("narrow_layout", DEFAULT_NARROW_LAYOUT)),
+        show_todos=_to_bool(raw.get("show_todos", True)),
+        show_tools=_to_bool(raw.get("show_tools", False)),
+        show_tool_rollup=_to_bool(raw.get("show_tool_rollup", False)),
+        show_agents=_to_bool(raw.get("show_agents", False)),
+        show_ip_risk=_to_bool(raw.get("show_ip_risk", False)),
+        show_fp_risk=_to_bool(raw.get("show_fp_risk", True)),
+        show_duration=_to_bool(raw.get("show_duration", False)),
+        show_lines=_to_bool(raw.get("show_lines", True)),
+        show_ahead_behind=_to_bool(raw.get("show_ahead_behind", False)),
+        show_version=_to_bool(raw.get("show_version", True)),
+        show_mode=_to_bool(raw.get("show_mode", False)),
+        mode_gradient=_to_bool(raw.get("mode_gradient", True)),
+        bar_shimmer=_to_bool(raw.get("bar_shimmer", False)),
+        show_forecast=_to_bool(raw.get("show_forecast", True)),
+        show_projection=_to_bool(raw.get("show_projection", True)),
+        cache_ttl_seconds=int(raw.get("cache_ttl_seconds", DEFAULT_CACHE_TTL_SECONDS) or DEFAULT_CACHE_TTL_SECONDS),
+        api_mode=str(raw.get("api_mode", DEFAULT_API_MODE)),
+        warning_threshold=raw.get("warning_threshold"),
+        critical_threshold=raw.get("critical_threshold"),
+        color_ok=raw.get("color_ok") or None,
+        color_warn=raw.get("color_warn") or None,
+        color_hot=raw.get("color_hot") or None,
+        color_worktree=raw.get("color_worktree") or None,
+        worktree_glyph=str(raw.get("worktree_glyph", "🌳") or "🌳"),
+        auto_upgrade=_to_bool(raw.get("auto_upgrade", True)),
+        lang=str(raw.get("lang", "auto") or "auto"),
+    )
+
+
+# Bumped when an upgrade deliberately resets everyone's look. The file records
+# the version it has seen, so the reset runs once and a later explicit choice
+# (`cs config set style classic`) sticks.
+UI_VERSION = 3
+
+
+def _migrate_ui(raw: dict, path: Path) -> dict:
+    """Apply each appearance reset once; later explicit choices stick."""
+    try:
+        seen = int(raw.get("ui_version", 0))
+    except (TypeError, ValueError):
+        seen = 0
+    if seen >= UI_VERSION:
+        return raw
+    raw = dict(raw)
+    if seen < 1:
+        raw.pop("style", None)  # 3.49.0: move to aurora once.
+    if seen < 2:
+        raw.pop("show_mode", None)  # 3.49.4: hide the extra mode line.
+    if seen < 3:
+        # 3.50.0: only aurora / classic and the graphite theme remain.
+        if raw.get("style") not in (None, "aurora", "classic"):
+            raw.pop("style", None)
+        if raw.get("theme") not in (None, "graphite"):
+            raw.pop("theme", None)
+        raw.pop("auto_compact_width", None)
+    raw["ui_version"] = UI_VERSION
+    try:
+        from .cache import atomic_write_text
+        atomic_write_text(path, json.dumps(raw, indent=2, ensure_ascii=False) + "\n")
+        invalidate_rendered()
+    except OSError:
+        pass
+    return raw
+
+
+def sparse_dict(cfg: StatusbarConfig) -> dict:
+    """The config as *only* the keys that differ from the defaults.
+
+    Writing every field (the old behavior) froze whatever the defaults happened
+    to be on the day the file was first written: one `cs config set <anything>`
+    stamped all ~35 values into JSON, and every later change to a default was
+    then invisible to that user forever. `show_project_branch` shipped default
+    off and flipped to on hours later — anyone who wrote a config in between
+    kept the second line hidden for months, with no way to tell why.
+
+    Storing only real choices makes the file mean "what I changed", so
+    unmentioned keys keep following the code's default.
+    """
+    defaults = asdict(StatusbarConfig())
+    return {k: v for k, v in asdict(cfg).items() if v != defaults[k]}
+
+
+def explicit_keys(path: Optional[Path] = None) -> set:
+    """Keys actually present in the config file — i.e. deliberate choices.
+
+    Everything else is following the default. `cs config show` uses this to
+    say which is which, so a stale value can never masquerade as a default.
+    """
+    path = CONFIG_PATH if path is None else path
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    return set(raw) & VALID_KEYS if isinstance(raw, dict) else set()
+
+
+def save_config(cfg: StatusbarConfig, path: Optional[Path] = None) -> None:
+    """Persist config atomically — Ctrl+C mid-write must not corrupt JSON.
+
+    Only non-default values are written; see `sparse_dict`.
+    """
+    live = path is None or path == CONFIG_PATH
+    path = CONFIG_PATH if path is None else path
+    from .cache import atomic_write_text
+    data = sparse_dict(cfg)
+    data["ui_version"] = UI_VERSION
+    atomic_write_text(
+        path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    if live:
+        invalidate_rendered()
+
+
+def invalidate_rendered() -> None:
+    """Drop every session's daemon render so the next tick redraws inline.
+
+    The daemon re-renders about once a second and the cache fast paths (Go
+    and Python) never look at the config file, so `cs config set style X`
+    followed straight away by a render used to serve the old look. Without a
+    meta file both fast paths fall through to an inline render with the new
+    config; the daemon rewrites the meta on its next pass. Best-effort.
+    """
+    from .render_thin import _SESSIONS_DIR
+    try:
+        entries = list(_SESSIONS_DIR.iterdir())
+    except OSError:
+        return
+    for d in entries:
+        try:
+            (d / "rendered.meta.json").unlink()
+        except OSError:
+            pass
+
+
+VALID_KEYS = {
+    "style", "theme", "density", "bar_glyph", "looks_seen", "auto_compact_width",
+    "show_weekly", "show_per_model", "show_language", "show_cost", "show_balance", "balance_bar",
+    "show_cache_age",
+    "show_project_branch", "show_ocs",
+    "show_cwd", "cwd_style", "narrow_layout",
+    "show_todos", "show_tools", "show_tool_rollup", "show_agents",
+    "show_ip_risk", "show_fp_risk",
+    "show_duration", "show_lines", "show_ahead_behind", "show_version",
+    "bar_shimmer", "show_forecast", "show_projection",
+    "show_mode", "mode_gradient",
+    "cache_ttl_seconds", "api_mode",
+    "warning_threshold", "critical_threshold",
+    "color_ok", "color_warn", "color_hot", "color_worktree", "lang",
+    "auto_upgrade", "worktree_glyph",
+}
+_VALID_API_MODE = {"auto", "on", "off"}
+_BOOL_KEYS = {"show_weekly", "show_per_model", "show_language", "show_cost", "show_balance",
+              "balance_bar",
+              "show_cache_age",
+              "show_project_branch", "show_ocs",
+              "show_cwd",
+              "show_todos", "show_tools", "show_tool_rollup", "show_agents",
+              "show_ip_risk", "show_fp_risk",
+              "show_duration", "show_lines", "show_ahead_behind", "show_version",
+              "bar_shimmer", "show_forecast", "show_projection",
+              "show_mode", "mode_gradient", "auto_upgrade"}
+_FLOAT_KEYS = {"warning_threshold", "critical_threshold"}
+_INT_KEYS = {"auto_compact_width", "cache_ttl_seconds", "looks_seen"}
+_COLOR_KEYS = {"color_ok", "color_warn", "color_hot", "color_worktree"}
+_VALID_DENSITY = {"compact", "regular", "cozy"}
+_VALID_BAR_GLYPH = {"block", "thin"}
+_VALID_CWD_STYLE = {"basename", "full"}
+_VALID_NARROW_LAYOUT = {"drop", "stack"}
+_VALID_LANG = {"auto", "zh", "en"}
+
+
+def set_value(key: str, value: str, path: Optional[Path] = None) -> StatusbarConfig:
+    path = CONFIG_PATH if path is None else path
+    if key not in VALID_KEYS:
+        raise KeyError(f"unknown config key: {key} (valid: {sorted(VALID_KEYS)})")
+    cfg = load_config(path)
+    if key in _FLOAT_KEYS:
+        try:
+            new_val = float(value)
+        except ValueError as e:
+            raise ValueError(f"{key} must be a number, got {value!r}") from e
+        # Cross-field check: warning < critical must hold or every render crashes.
+        # Use the resulting pair (existing other field + new value) to validate.
+        from .progress import normalize_thresholds
+        if key == "warning_threshold":
+            other = cfg.critical_threshold
+        else:
+            other = cfg.warning_threshold
+        try:
+            if key == "warning_threshold":
+                normalize_thresholds(new_val, other)
+            else:
+                normalize_thresholds(other, new_val)
+        except ValueError as e:
+            raise ValueError(
+                f"refusing to save: {key}={new_val} would make the pair invalid "
+                f"(warning_threshold={cfg.warning_threshold}, "
+                f"critical_threshold={cfg.critical_threshold}). "
+                f"Set both keys or use --warning-threshold / --critical-threshold "
+                f"together."
+            ) from e
+        setattr(cfg, key, new_val)
+        save_config(cfg, path)
+        return cfg
+    if key in _COLOR_KEYS:
+        # Empty string clears the override (falls back to theme default).
+        if value == "":
+            setattr(cfg, key, None)
+        else:
+            from .themes import parse_hex_color
+            r, g, b = parse_hex_color(value)
+            setattr(cfg, key, f"#{r:02x}{g:02x}{b:02x}")
+        save_config(cfg, path)
+        return cfg
+    if key in _INT_KEYS:
+        try:
+            setattr(cfg, key, int(value))
+        except ValueError as e:
+            raise ValueError(f"{key} must be an integer, got {value!r}") from e
+    elif key in _BOOL_KEYS:
+        setattr(cfg, key, _to_bool(value))
+    elif key == "density":
+        if value not in _VALID_DENSITY:
+            raise ValueError(f"density must be one of {sorted(_VALID_DENSITY)}, got {value!r}")
+        setattr(cfg, key, value)
+    elif key == "bar_glyph":
+        if value not in _VALID_BAR_GLYPH:
+            raise ValueError(f"bar_glyph must be one of {sorted(_VALID_BAR_GLYPH)}, got {value!r}")
+        setattr(cfg, key, value)
+        # Choosing a look by any route counts as having seen the looks, so the
+        # bar's "new looks · cs theme" nudge doesn't outlive the choice.
+        cfg.looks_seen = max(cfg.looks_seen, LOOKS_VERSION)
+    elif key == "lang":
+        if value not in _VALID_LANG:
+            raise ValueError(f"lang must be one of {sorted(_VALID_LANG)}, got {value!r}")
+        setattr(cfg, key, value)
+    elif key == "api_mode":
+        if value not in _VALID_API_MODE:
+            raise ValueError(f"api_mode must be one of {sorted(_VALID_API_MODE)}, got {value!r}")
+        setattr(cfg, key, value)
+    elif key == "worktree_glyph":
+        from ._display import visible_width
+        if not value or "\n" in value or "\033" in value:
+            raise ValueError("worktree_glyph must be a printable symbol")
+        if visible_width(value) > 2:
+            raise ValueError(
+                f"worktree_glyph must fit in 1-2 terminal cells, "
+                f"{value!r} needs {visible_width(value)}"
+            )
+        setattr(cfg, key, value)
+    elif key == "cwd_style":
+        if value not in _VALID_CWD_STYLE:
+            raise ValueError(f"cwd_style must be one of {sorted(_VALID_CWD_STYLE)}, got {value!r}")
+        setattr(cfg, key, value)
+    elif key == "narrow_layout":
+        if value not in _VALID_NARROW_LAYOUT:
+            raise ValueError(f"narrow_layout must be one of {sorted(_VALID_NARROW_LAYOUT)}, got {value!r}")
+        setattr(cfg, key, value)
+    elif key == "style":
+        # Lazy import to avoid a config↔styles cycle at module load.
+        from .styles import list_styles
+        valid = set(list_styles())
+        if value not in valid:
+            raise ValueError(f"style must be one of {sorted(valid)}, got {value!r}")
+        setattr(cfg, key, value)
+        cfg.looks_seen = max(cfg.looks_seen, LOOKS_VERSION)
+    elif key == "theme":
+        from .themes import list_themes
+        valid = {t.name for t in list_themes()}
+        if value not in valid:
+            raise ValueError(f"theme must be one of {sorted(valid)}, got {value!r}")
+        setattr(cfg, key, value)
+    else:
+        setattr(cfg, key, value)
+    save_config(cfg, path)
+    return cfg
+
+
+def unset_value(key: str, path: Optional[Path] = None) -> StatusbarConfig:
+    """Drop a key from the config file so it follows the code default again.
+
+    The counterpart to `set_value`: with sparse storage, "no opinion" is a
+    state the file can actually express, and this is how you get back to it.
+    """
+    path = CONFIG_PATH if path is None else path
+    if key not in VALID_KEYS:
+        raise KeyError(f"unknown config key: {key} (valid: {sorted(VALID_KEYS)})")
+    cfg = load_config(path)
+    setattr(cfg, key, getattr(StatusbarConfig(), key))
+    save_config(cfg, path)
+    return cfg
+
+
+def get_value(key: str, path: Optional[Path] = None) -> Any:
+    path = CONFIG_PATH if path is None else path
+    if key not in VALID_KEYS:
+        raise KeyError(f"unknown config key: {key}")
+    return getattr(load_config(path), key)
+
+
+def resolve_style(cli_value: Optional[str], cfg: StatusbarConfig) -> str:
+    if cli_value:
+        return cli_value
+    env = os.environ.get("CLAUDE_STATUSBAR_STYLE")
+    if env:
+        return env
+    return cfg.style
+
+
+def resolve_api_mode(cfg: StatusbarConfig, env: Optional[dict] = None) -> str:
+    """Effective api_mode: CS_API_MODE env wins over the saved config, so a relay
+    user can force the layout per-shell without editing config. Unknown values
+    fall through to detection (is_no_quota_mode treats non on/off as auto).
+
+    `env` defaults to os.environ; the render path passes the per-session env
+    (stamped by render_thin) so the shared daemon reads the session's CS_API_MODE
+    rather than its own frozen start-time value."""
+    source = os.environ if env is None else env
+    val = source.get("CS_API_MODE")
+    if val:
+        return val.strip().lower()
+    return cfg.api_mode
+
+
+def resolve_theme(cli_value: Optional[str], cfg: StatusbarConfig) -> str:
+    if cli_value:
+        return cli_value
+    env = os.environ.get("CLAUDE_STATUSBAR_THEME")
+    if env:
+        return env
+    return cfg.theme

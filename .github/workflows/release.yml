@@ -1,0 +1,248 @@
+name: Release
+
+# The version bump IS the release. Land a commit on main that changes the
+# version in pyproject.toml (the way every `fix(...)，并发布 3.4x.y` commit
+# already does) and this cuts the tag, publishes the GitHub Release with the
+# CHANGELOG section as its notes, attaches the platform binaries and uploads
+# the wheel to PyPI.
+#
+# Existing tags are immutable; retry only missing artifacts from that tag.
+# Binary artifacts stay private in CI until every checksum is verified.
+
+on:
+  # Every push to main, not just ones touching pyproject.toml: the plan job is
+  # a checkout and one script, and running it always means a release that died
+  # half-way (tag cut, upload failed) retries on the next push instead of
+  # needing someone to notice. Artifact completeness decides, not the paths.
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (defaults to pyproject.toml, e.g. 3.43.2)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      title: ${{ steps.plan.outputs.title }}
+      ref: ${{ steps.plan.outputs.ref }}
+      binaries: ${{ steps.plan.outputs.binaries }}
+      pypi: ${{ steps.plan.outputs.pypi }}
+      draft: ${{ steps.plan.outputs.draft }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tags, so an already-released version is detectable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Decide
+        id: plan
+        env:
+          REQUESTED: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${REQUESTED:-$(python scripts/release_meta.py version)}"
+          python scripts/release_plan.py "${version}"
+
+  tests:
+    name: Tests
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            suite: tests/
+          - os: macos-14
+            suite: tests/test_review_regressions.py tests/test_release_recovery.py tests/test_setup_windows_exe.py
+          - os: windows-latest
+            suite: tests/test_review_regressions.py tests/test_release_recovery.py tests/test_setup_windows_exe.py
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install package and test dependencies
+        run: |
+          pip install -e .
+          pip install pytest
+          # the real uv: tests/test_uv_args.py checks our upgrade commands parse
+          pip install uv
+      # main is protected by the same suite in ci.yml, but a release is the one
+      # place where "it passed on the PR" is not good enough: the tag is public
+      # and PyPI uploads are immutable.
+      - name: Run tests
+        run: python -m pytest ${{ matrix.suite }} -q
+
+  github-release:
+    name: Prepare tag
+    needs: [plan, tests]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # creates the tag and the release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Render release notes
+        run: python scripts/release_meta.py notes "${{ needs.plan.outputs.version }}" > release-notes.md
+
+      - name: Ensure immutable tag exists before building bundles
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Binary and PyPI jobs check out this immutable source tag.
+          git ls-remote --tags origin "refs/tags/$TAG" > existing-tag.txt
+          if [ ! -s existing-tag.txt ]; then
+            git tag "$TAG" HEAD
+            git push origin "refs/tags/$TAG"
+          else
+            git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
+            test "$(git rev-parse "$TAG^{commit}")" = "$(git rev-parse HEAD)"
+          fi
+
+
+  binaries:
+    name: Binaries
+    needs: [plan, github-release]
+    if: needs.plan.outputs.binaries == 'true'
+    # Called, not triggered: a release created with GITHUB_TOKEN does not fire
+    # `release: published`, so waiting for that event would hang forever.
+    uses: ./.github/workflows/release-binaries.yml
+    permissions:
+      contents: write
+      actions: read
+    secrets: inherit
+    with:
+      tag: ${{ needs.plan.outputs.tag }}
+      stage_only: true
+
+  pypi:
+    name: PyPI
+    needs: [plan, github-release]
+    if: needs.plan.outputs.pypi == 'true'
+    runs-on: ubuntu-latest
+    # No `environment:` — a trusted publisher configured WITHOUT an environment
+    # name must not find one here, or PyPI rejects the upload. Add it on both
+    # sides together if you want required reviewers on releases.
+    permissions:
+      contents: read
+      id-token: write   # trusted publishing (OIDC) — no token in secrets
+    env:
+      HAS_TOKEN: ${{ secrets.PYPI_API_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.tag }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      # Trusted publishing is the destination; the token path keeps the
+      # workflow working until the PyPI publisher is configured.
+      - name: Publish (trusted publishing)
+        if: env.HAS_TOKEN != 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+      - name: Publish (API token)
+        if: env.HAS_TOKEN == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
+
+  finalize:
+    name: Verify and publish
+    needs: [plan, github-release, binaries, pypi]
+    if: >-
+      always() && needs.plan.outputs.release == 'true' &&
+      needs.github-release.result == 'success' &&
+      (needs.binaries.result == 'success' || needs.binaries.result == 'skipped') &&
+      (needs.pypi.result == 'success' || needs.pypi.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      # Verification tooling comes from the workflow revision; artifacts come
+      # from the immutable release tag, even when repairing an older version.
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        if: needs.plan.outputs.binaries == 'true'
+        with:
+          pattern: cs-*.tar.gz
+          path: new-assets
+          merge-multiple: true
+      - name: Verify checksums and render notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          mkdir -p release-assets
+          if [ "${{ needs.plan.outputs.binaries }}" = "true" ]; then
+            cp new-assets/* release-assets/
+          fi
+          if [ "${{ needs.plan.outputs.draft }}" != "true" ]; then
+            mkdir -p existing-assets
+            gh release download "$TAG" --dir existing-assets --pattern 'cs-*'
+            cp -n existing-assets/* release-assets/
+          fi
+          python scripts/verify_release_assets.py --directory release-assets --version "${{ needs.plan.outputs.version }}"
+          python scripts/release_meta.py notes "${{ needs.plan.outputs.version }}" > release-notes.md
+      - uses: softprops/action-gh-release@v2
+        if: needs.plan.outputs.binaries == 'true'
+        with:
+          tag_name: ${{ needs.plan.outputs.tag }}
+          # The immutable tag already identifies the tested source. Current
+          # HEAD avoids a workflow-write permission check against an old tag.
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.plan.outputs.title }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: false
+          files: |
+            new-assets/cs-*.tar.gz
+            new-assets/cs-*.tar.gz.sha256
+            new-assets/cs-*.dmg
+            new-assets/cs-*.dmg.sha256

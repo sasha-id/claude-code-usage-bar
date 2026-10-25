@@ -1,0 +1,143 @@
+# Configuration
+
+## Configuration file
+
+Persisted to `~/.claude/claude-statusbar.json`:
+
+```json
+{
+  "style": "aurora",
+  "bar_glyph": "block",
+  "density": "regular",
+  "narrow_layout": "drop",
+  "show_weekly": true,
+  "show_language": true,
+  "show_cost": false,
+  "show_balance": true,
+  "balance_bar": true,
+  "show_cache_age": true,
+  "show_project_branch": true,
+  "show_ocs": true,
+  "show_todos": true,
+  "show_tools": false,
+  "show_agents": false,
+  "show_duration": false,
+  "show_lines": true,
+  "show_ahead_behind": false
+}
+```
+
+| Key | Values | What it does |
+|-----|--------|--------------|
+| `style` | `aurora` / `classic` | Layout (see [Looks](styles-and-themes.md)) |
+| `theme` | `graphite` | Palette — the only one since 3.50.0; tune colors with `color_*` |
+| `density` | `compact` / `regular` / `cozy` | Segment padding (aurora) |
+| `narrow_layout` | `drop` (default) / `stack` | When the first line is too wide, `stack` moves quota bars and other segments onto more rows before dropping forecasts or projections. A row that still exceeds the pane width is shortened or clipped. |
+| `bar_glyph` | `block` (default) / `thin` | Aurora bar cells: `■` blocks or the thin `━` line |
+| `looks_seen` | int, `0` | Written by `cs theme`. While it's below the current looks version the bar shows a one-line `✦ New looks available` hint, and an interactive `cs upgrade` opens the picker |
+| `show_cost` | bool, `false` | Append `$ X.XX` session cost (API-equivalent value for subscribers) |
+| `show_balance` / `balance_bar` | bool, `true` | No-quota relay balance as a fuel-gauge bar — auto-hidden if the relay doesn't support it |
+| `show_cache_age` | bool, `true` | `cache 4m23s` prompt-cache countdown (TTL auto-detected 5m/1h) |
+| `show_project_branch` | bool, `true` | Second line: `⧉ worktree` (linked worktrees only) + project + branch + `●` dirty dot |
+| `show_ahead_behind` | bool, `false` | `↑2↓1` commits ahead/behind on the branch line |
+| `show_ocs` | bool, `true` | `ocs boss · claude-7d5a5d07 · ✉3 · lan win` on its own line — this session's [open-cross-session](https://github.com/leeguooooo/open-cross-session) address, unread DMs and LAN bridge state; auto-hidden unless ocs ≥ 0.5.0 is installed |
+| `show_todos` | bool, `true` | Activity line: in-progress todo + `done/total` |
+| `show_tools` / `show_tool_rollup` | bool, `false` | Active tool / completed-tool frequency rollup |
+| `show_projection` / `show_forecast` | bool, `true` | `→NN%` projection / `⚠ETA` at-risk warning chip |
+| `show_agents` | bool, `false` | One bottom line per running subagent (Claude Code shows these natively too) |
+| `show_duration` / `show_lines` | bool | Session `⏱` duration / `+/−` lines on the identity line |
+| `show_version` | bool, `true` | Faint `· vX.Y.Z` (+ amber `↑newver` when a newer PyPI release exists) |
+| `show_mode` | bool, `false` | Show the `⚙` effort/thinking/fast/style line |
+| `mode_gradient` | bool, `true` | Gradient tint when the session-mode line is enabled |
+| `show_weekly` / `show_language` | bool | Toggle the 7d bar / language-coach segment |
+| `bar_shimmer` | bool, `false` | Experimental twinkling starfield on bars (classic only) |
+| `color_ok` / `color_warn` / `color_hot` / `color_worktree` | hex, `null` | Override the theme's severity colors / worktree-marker hue; empty string restores the theme default |
+| `worktree_glyph` | string, `🌳` | Glyph inside the worktree count: `worktree (🌳3)`. Any 1-2 cell symbol (`⑂`, `⧉`, `🌲`) |
+| `auto_upgrade` | bool, `true` | Once-a-day detached self-upgrade, every install channel including the standalone binary; `CLAUDE_STATUSBAR_NO_UPDATE=1` overrides |
+| `lang` | `auto` / `zh` / `en` | Language of the IP / endpoint notice lines. `auto` follows the OS (macOS: first system language, not `$LANG`) |
+| `api_mode` | `auto` / `on` / `off` | No-quota mode (see [No-quota mode](no-quota-mode.md)); `CS_API_MODE` env overrides |
+
+Full per-key detail is in the [segment reference](segments.md) or
+`cs config show`. Set with `cs config set <key> <value>`;
+`cs config unset <key>` returns one key to the default; `cs config reset`
+restores all of them.
+
+**The file stores only what you changed.** Keys you never set stay out of it and
+keep following the code's default, so a default that improves in a later release
+reaches you. (Before v3.34.0 every key was written on every save, which froze the
+defaults as they stood the day you first ran `cs config set` — anything that
+changed afterwards never arrived.) `cs config show` marks each value that is
+merely following the default, so a stored choice can't masquerade as one.
+
+## Environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `CLAUDE_STATUSBAR_STYLE=classic` | Render with this style (overrides config file) |
+| `CLAUDE_STATUSBAR_NO_UPDATE=1` | Disable automatic update checks |
+| `CLAUDE_STATUSBAR_WARNING_THRESHOLD=40` | Switch from green to yellow at 40% |
+| `CLAUDE_STATUSBAR_CRITICAL_THRESHOLD=85` | Switch from yellow to red at 85% |
+| `NO_COLOR=1` | Disable ANSI colors |
+
+`CLAUDE_PLAN` is still accepted for legacy compatibility, but it no longer changes the rendered status line.
+
+## JSON output
+
+Use `--json-output` if you want a machine-readable payload instead of the formatted status line:
+
+```bash
+cs --json-output
+```
+
+## Usage cheatsheet
+
+```bash
+cs                              # render the status line (default command)
+cs --style classic              # render with a one-off style
+
+# Configuration
+cs config show                  # show all persistent config
+cs config set style classic     # persist style → ~/.claude/claude-statusbar.json
+cs config set narrow_layout stack # preserve quota forecasts in narrow panes
+cs config set bar_glyph thin    # aurora: thin ━ line instead of ■ blocks
+cs config set show_cost true    # session $ cost segment
+cs config set show_cache_age false  # hide prompt-cache age segment
+cs config set show_tools true   # activity line: active tool + completed rollup
+cs config set show_agents true  # bottom line(s): running subagents + elapsed
+cs config set show_duration true # identity line: ⏱ session duration
+cs config set show_lines false  # hide identity-line +added -removed (on by default)
+cs config set show_version false  # hide the faint · vX.Y.Z (+ ↑update hint) at line end
+cs config set show_mode true     # opt in to the ⚙ effort/thinking/fast/style line
+cs config set mode_gradient false # mode line: plain per-tier colours, no gradient
+cs config set show_ahead_behind true  # ↑2↓1 on the project/branch line
+cs config set api_mode on        # force no-quota layout (relay/Bedrock/Vertex; default auto)
+cs config set bar_shimmer true  # experimental: twinkling starfield on the battery bars
+cs config set show_projection false  # hide the →NN% end-of-window projection
+cs config set show_forecast false    # hide the ⚠~eta at-risk warning chip
+cs config set show_todos false  # hide the todo-progress segment (on by default)
+cs config reset                 # wipe config back to defaults
+
+# Discovery
+cs styles                       # list available styles
+cs preview                      # the three looks with YOUR real data
+cs preview --style classic      # just one style
+
+# Daemon mode (default since v3.6.0; v3.2 introduced it as opt-in)
+cs --setup                      # default: writes `cs render` + starts daemon
+cs --setup --inline             # opt out, use legacy inline path
+cs daemon start                 # start daemon (manual)
+cs daemon stop                  # stop daemon
+cs daemon status                # pid + rendered.ansi freshness
+cs daemon install               # install LaunchAgent (macOS) / systemd unit (Linux)
+cs daemon uninstall             # remove the OS-level service
+cs daemon service               # report whether the OS service is registered
+
+# Diagnostics + flags
+cs doctor                       # self-diagnostic — paste output in bug reports
+cs --json-output                # machine-readable JSON
+cs --no-color                   # disable ANSI colors
+cs --warning-threshold 40 --critical-threshold 85
+cs --no-auto-update             # skip the per-day PyPI version check
+```
+
+`--plan` still exists for older scripts, but is deprecated and no longer changes the rendered output.
