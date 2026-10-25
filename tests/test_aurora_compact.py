@@ -33,7 +33,7 @@ def _render(**changes):
 
 def test_compact_single_row_layout():
     assert _render() == (
-        "5h ■■■■■■■■ 17% 3h03m 7d ■■■■■■■■  7% 4d09h"
+        "5h ■■■■■■■■ 17% 3h03m · 7d ■■■■■■■■  7% 4d09h"
         " │ k3.1-pro[1m] ✳high 75.1k/1.0M"
         " │ ⎇ chore/api-smoke-refresh ⑂api-smoke-refresh · ❄ 4m39s"
     )
@@ -42,7 +42,7 @@ def test_compact_single_row_layout():
 def test_stacked_layout_keeps_compact_quota_separator():
     out = _render(max_width=60, narrow_layout="stack")
 
-    assert "3h03m 7d" in out
+    assert "3h03m · 7d" in out
     assert "3h03m │ 7d" not in out
 
 

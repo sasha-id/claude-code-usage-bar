@@ -206,7 +206,7 @@ def test_aurora_plain_layout():
     out = render("aurora", msgs_pct=4, weekly_pct=74, reset_5h="4h16m",
                  reset_7d="2d18h", model="Opus 5.5(70.0k/1.0M)", ctx_pct=7,
                  cache_age_text="59m12s", use_color=False)
-    assert out == ("5h ■■■■■■■■  4% 4h16m 7d ■■■■■■■■ 74% 2d18h"
+    assert out == ("5h ■■■■■■■■  4% 4h16m · 7d ■■■■■■■■ 74% 2d18h"
                    " │ Opus 5.5 70.0k/1.0M")
 
 
@@ -215,7 +215,7 @@ def test_aurora_thin_bar_glyph():
     out = render("aurora", msgs_pct=4, weekly_pct=74, reset_5h="4h16m",
                  reset_7d="2d18h", model="Opus 5.5", ctx_pct=7,
                  bar_glyph="thin", use_color=False)
-    assert out.startswith("5h ━━━━━━━━  4% 4h16m 7d ━━━━━━━━ 74%")
+    assert out.startswith("5h ━━━━━━━━  4% 4h16m · 7d ━━━━━━━━ 74%")
     assert "■" not in out
 
 

@@ -169,7 +169,7 @@ def _stack(segs: list, sep: str, labels: list, scoped: list,
     rest = segs[len(labels):]
     row = quota[0][1]
     for index, (_, seg) in enumerate(quota[1:], 1):
-        row += (" " if compact_quota and index == 1 else sep) + seg
+        row += (" · " if compact_quota and index == 1 else sep) + seg
     if visible_width(row) <= max_width:
         lines, cur = [], row
     else:
@@ -301,7 +301,7 @@ def render_aurora(
                      and not (quota_stale and msgs_pct is None and weekly_pct is None))
     line = parts[0]
     for index, part in enumerate(parts[1:], 1):
-        line += (" " if compact_quota and index == 1 else sep) + part
+        line += (" · " if compact_quota and index == 1 else sep) + part
     if _segments is not None:
         _segments.extend(parts if use_color else [_strip(part) for part in parts])
     if not use_color:
