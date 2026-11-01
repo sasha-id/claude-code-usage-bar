@@ -9,6 +9,16 @@ For a quick overview of the latest release, see the
 
 ---
 
+## v3.53.0 — 2026-11-01
+
+- Drop the Aurora 5h bar when Claude Code sends no `five_hour` window. Plans
+  without a 5h limit now show only the weekly bar and its reset countdown:
+  `7d ■■■■■■■■  9% 3d01h │ Opus 5.5 …` instead of
+  `5h ■■■■■■■■ --% -- · 7d ■■■■■■■■  9% 3d01h │ …`.
+  Accounts that still report a 5h window keep both bars.
+
+---
+
 ## v3.52.2 — 2026-10-24
 
 - Prevent a newly observed session replaying an older quota snapshot from

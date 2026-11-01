@@ -121,3 +121,17 @@ def test_core_uses_precise_session_duration_and_skips_cache_scan(
     assert "⏱" not in out
     assert "COLD" not in out
     assert cache_calls == []
+
+
+def test_missing_five_hour_window_omits_5h_bar():
+    out = _render(msgs_pct=None, reset_5h="--")
+
+    assert out.startswith("7d ■■■■■■■■  7% 4d09h │ k3.1-pro[1m]")
+    assert "5h" not in out
+
+
+def test_missing_five_hour_window_stacks_7d_alone():
+    out = _render(msgs_pct=None, reset_5h="--", max_width=40,
+                  narrow_layout="stack")
+
+    assert out.splitlines()[0] == "7d ■■■■■■■■  7% 4d09h"

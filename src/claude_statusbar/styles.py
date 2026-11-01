@@ -131,9 +131,15 @@ def _quota_labels(fn, kw) -> list:
     if (kw.get("quota_stale") and kw.get("msgs_pct") is None
             and kw.get("weekly_pct") is None):
         return [""]  # the one `⟳ 5h/7d stale` notice
-    if fn is render_aurora and not kw.get("show_weekly", True):
-        return ["5h"]
+    if fn is render_aurora:
+        return ((["5h"] if _has_5h(kw.get("msgs_pct"), kw.get("reset_5h")) else [])
+                + (["7d"] if kw.get("show_weekly", True) else []))
     return ["5h", "7d"]
+
+
+def _has_5h(msgs_pct, reset_5h) -> bool:
+    """False once the payload carries no five_hour window at all."""
+    return msgs_pct is not None or reset_5h not in (None, "", "--")
 
 
 def _shorter_models(model: str) -> tuple:
@@ -167,10 +173,12 @@ def _stack(segs: list, sep: str, labels: list, scoped: list,
     """
     quota = list(zip(labels, segs)) + list(scoped)
     rest = segs[len(labels):]
-    row = quota[0][1]
+    row = quota[0][1] if quota else ""
     for index, (_, seg) in enumerate(quota[1:], 1):
         row += (" · " if compact_quota and index == 1 else sep) + seg
-    if visible_width(row) <= max_width:
+    if not quota:
+        lines, cur = [], None
+    elif visible_width(row) <= max_width:
         lines, cur = [], row
     else:
         lines = _align_quotas(quota, max_width)
@@ -255,6 +263,7 @@ def render_aurora(
                 f"{MUTE}{reset or '--'}{RESET}")
 
     sep = _line_separator(render_aurora, theme, density)
+    has_5h = _has_5h(msgs_pct, reset_5h)
     parts = []
 
     if no_quota:
@@ -263,7 +272,8 @@ def render_aurora(
     elif quota_stale and msgs_pct is None and weekly_pct is None:
         parts.append(f"{_fg(theme.s_warn)}⟳ 5h/7d stale·restart{RESET}")
     else:
-        parts.append(window("5h", msgs_pct, reset_5h))
+        if has_5h:
+            parts.append(window("5h", msgs_pct, reset_5h))
         if show_weekly:
             parts.append(window("7d", weekly_pct, reset_7d))
 
@@ -297,7 +307,7 @@ def render_aurora(
     if bypass:
         parts.append(f"{_fg(theme.s_hot)}{BOLD}⚠ BYPASS{RESET}")
 
-    compact_quota = (not no_quota and show_weekly
+    compact_quota = (not no_quota and show_weekly and has_5h
                      and not (quota_stale and msgs_pct is None and weekly_pct is None))
     line = parts[0]
     for index, part in enumerate(parts[1:], 1):
